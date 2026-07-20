@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{
     Client, StatusCode,
-    header::{HeaderMap, HeaderValue},
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,7 +16,14 @@ use tokio::{
     sync::{Mutex, OnceCell, RwLock, mpsc},
     time::{Instant, interval_at, sleep},
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        handshake::client::{Request as WebSocketRequest, Response as WebSocketResponse},
+    },
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -545,24 +552,28 @@ impl JellyfinClient {
         commands: &mpsc::Sender<RemoteCommand>,
         shutdown: &CancellationToken,
     ) -> Result<()> {
-        let (token, _, _) = self.auth_snapshot().await;
-        let mut url = self.config.server.clone();
-        url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
-            .map_err(|()| anyhow!("无法构造 WebSocket 地址"))?;
-        url = url.join("socket").context("无法构造 WebSocket 地址")?;
-        url.query_pairs_mut()
-            .append_pair("api_key", &token)
-            .append_pair("deviceId", self.config.device_id());
-
-        let (mut socket, _) = match connect_async(url.as_str()).await {
-            Ok(connection) => connection,
-            Err(tokio_tungstenite::tungstenite::Error::Http(response))
-                if response.status() == StatusCode::UNAUTHORIZED =>
-            {
-                self.reauthenticate_if_rejected(&token).await?;
-                bail!("WebSocket Access Token 已失效并完成重新登录");
+        let mut retried_authentication = false;
+        let (mut socket, _) = loop {
+            let (token, _, _) = self.auth_snapshot().await;
+            let request = websocket_request(&self.config, &token)?;
+            match connect_async(request).await {
+                Ok(connection) => break connection,
+                Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                    if !retried_authentication
+                        && matches!(
+                            response.status(),
+                            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                        ) =>
+                {
+                    warn!(status = %response.status(), "WebSocket 鉴权被拒绝，正在重新登录");
+                    self.reauthenticate_if_rejected(&token).await?;
+                    retried_authentication = true;
+                }
+                Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                    bail!(websocket_http_error(&response));
+                }
+                Err(error) => return Err(error).context("WebSocket 握手失败"),
             }
-            Err(error) => return Err(error).context("WebSocket 握手失败"),
         };
         info!("Jellyfin WebSocket 已连接");
 
@@ -809,10 +820,10 @@ fn auth_headers(config: &Config, token: Option<&str>) -> Result<HeaderMap> {
         token_part,
     );
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "X-Emby-Authorization",
-        HeaderValue::from_str(&auth).context("用户名、Token 或设备名称含有非法 HTTP 字符")?,
-    );
+    let auth =
+        HeaderValue::from_str(&auth).context("用户名、Token 或设备名称含有非法 HTTP 字符")?;
+    headers.insert(AUTHORIZATION, auth.clone());
+    headers.insert("X-Emby-Authorization", auth);
     if let Some(token) = token {
         headers.insert(
             "X-Emby-Token",
@@ -820,6 +831,42 @@ fn auth_headers(config: &Config, token: Option<&str>) -> Result<HeaderMap> {
         );
     }
     Ok(headers)
+}
+
+fn websocket_request(config: &Config, token: &str) -> Result<WebSocketRequest> {
+    let mut url = config.server.clone();
+    url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
+        .map_err(|()| anyhow!("无法构造 WebSocket 地址"))?;
+    url = url.join("socket").context("无法构造 WebSocket 地址")?;
+    url.query_pairs_mut()
+        .append_pair("api_key", token)
+        .append_pair("deviceId", config.device_id());
+
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .context("无法构造 WebSocket 握手请求")?;
+    request
+        .headers_mut()
+        .extend(auth_headers(config, Some(token))?);
+    Ok(request)
+}
+
+fn websocket_http_error(response: &WebSocketResponse) -> String {
+    let body = response
+        .body()
+        .as_deref()
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default();
+    let summary = body.chars().take(300).collect::<String>();
+    if summary.is_empty() {
+        format!("WebSocket 握手被服务器拒绝: HTTP {}", response.status())
+    } else {
+        format!(
+            "WebSocket 握手被服务器拒绝: HTTP {}: {summary}",
+            response.status()
+        )
+    }
 }
 
 fn playback_profile(
@@ -892,6 +939,35 @@ mod tests {
 
     use super::*;
     use crate::config::ConfigArgs;
+
+    #[test]
+    fn websocket_handshake_uses_query_and_standard_authentication() {
+        let encoded = STANDARD.encode("password");
+        let config = ConfigArgs::try_parse_from([
+            "jellyfin-mpv",
+            "--server",
+            "http://localhost:8096",
+            "--username",
+            "Alice",
+            "--password",
+            &encoded,
+            "--device-id",
+            "test-device",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap()
+        .unwrap();
+
+        let request = websocket_request(&config, "fresh-token").unwrap();
+        let uri = request.uri().to_string();
+        assert!(uri.contains("api_key=fresh-token"));
+        assert!(uri.contains("deviceId=test-device"));
+        let authorization = request.headers()[AUTHORIZATION].to_str().unwrap();
+        assert!(authorization.starts_with("MediaBrowser "));
+        assert!(authorization.contains("Token=\"fresh-token\""));
+        assert_eq!(request.headers()["X-Emby-Token"], "fresh-token");
+    }
 
     #[test]
     fn recognizes_only_supported_font_attachments() {

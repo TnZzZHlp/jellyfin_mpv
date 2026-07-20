@@ -7,6 +7,7 @@ mod login_ui;
 mod mpv;
 mod player;
 mod protocol;
+mod single_instance;
 mod tray;
 
 use std::{
@@ -21,7 +22,7 @@ use clap::Parser;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::time::ChronoLocal};
 
 use crate::{
     config::ConfigArgs, credential_store::save_login, jellyfin::JellyfinClient,
@@ -30,6 +31,18 @@ use crate::{
 
 #[tokio::main]
 async fn main() {
+    let _single_instance = match single_instance::acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            show_error_message("Jellyfin MPV Cast 已在运行，请使用通知区域中的现有实例。");
+            return;
+        }
+        Err(error) => {
+            show_error_message(&format!("无法检查程序是否已在运行：{error:#}"));
+            return;
+        }
+    };
+
     if let Err(error) = run().await {
         error!(error = ?error, "程序异常退出");
         show_error_message(&format!("{error:#}"));
@@ -134,6 +147,7 @@ fn init_logging() -> Result<PathBuf> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("jellyfin_mpv=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_timer(ChronoLocal::rfc_3339())
         .with_target(false)
         .with_ansi(false)
         .with_writer(make_writer)
