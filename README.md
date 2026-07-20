@@ -10,9 +10,10 @@
 - Access Token 被服务端注销或失效后，自动用用户名和密码重新登录并重试请求；
 - 接收播放、暂停、继续、停止、跳转、设置音量、静音和取消静音；
 - 加载 Jellyfin 选中的外部或文本型内嵌字幕，并支持播放中远程切换/关闭字幕；
-- 获取 Jellyfin 服务器备用字体，并下载媒体中的 TTF/OTF/TTC/OTC/WOFF/WOFF2 字体附件，供 ASS/SSA 字幕使用；
+- 分析当前 ASS/SSA 字幕声明的字体，并只下载媒体中名称匹配的 TTF/OTF/TTC/OTC/WOFF/WOFF2 字体附件；
 - 请求 `/Items/{itemId}/PlaybackInfo`，优先让 mpv 直接播放，必要时使用 Jellyfin 返回的转码流；
 - 为每次播放启动独立的外部 mpv，通过 JSON IPC 控制；
+- mpv 窗口标题显示当前 Jellyfin 媒体名称；
 - mpv 窗口默认最大化启动；
 - Windows 默认不显示控制台，只在通知区域显示托盘图标；托盘菜单可打开实时日志终端或安全退出；
 - Windows 下只允许一个接收端实例运行，重复启动会显示提示，避免相同设备的登录 Token 互相失效；
@@ -127,6 +128,6 @@ Jellyfin WebSocket 命令
    外部 mpv JSON IPC ─── 播放结束 ────▶ Jellyfin HTTP 停止上报
 ```
 
-程序会调用 Jellyfin `/FallbackFont/Fonts` 获取服务器配置的备用字体，并在进程内缓存；当前媒体的字体附件则通过 `/Videos/{videoId}/{mediaSourceId}/Attachments/{index}` 获取。播放时统一写入系统临时目录，通过 mpv `--sub-fonts-dir` 加载，并在播放结束后删除。单个字体限制为 32 MiB，每次播放最多写入 128 MiB；封面等非字体附件会被忽略。
+程序只处理当前媒体自带的字体附件，不请求 Jellyfin 服务器备用字体。选择 ASS/SSA 字幕后，程序会读取字幕的样式定义和行内 `\fn` 标签，再通过 `/Videos/{videoId}/{mediaSourceId}/Attachments/{index}` 下载名称匹配的字体。字体临时写入系统临时目录，通过 mpv `--sub-fonts-dir` 加载，并在播放结束后删除。单个字体限制为 32 MiB，每次播放最多写入 128 MiB；未被字幕引用的字体及封面等非字体附件会被忽略。
 
 第一版有意不处理播放队列、上一首/下一首、远程选音轨、多服务器、发现服务器和本地媒体库界面。PGS 等图片型内嵌字幕仍由原始媒体或 Jellyfin 转码流处理，不单独提取加载。

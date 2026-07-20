@@ -3,7 +3,7 @@ use std::{collections::HashMap, ffi::OsString, path::PathBuf, sync::Arc, time::D
 use anyhow::{Result, anyhow, bail};
 use tokio::{
     sync::mpsc,
-    time::{MissedTickBehavior, interval},
+    time::{MissedTickBehavior, interval, timeout},
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -13,6 +13,8 @@ use crate::{
     mpv::{MpvEvent, MpvHandle, MpvLaunch, spawn_mpv},
     protocol::{MediaStream, PlayRequest, PlaybackReport, PlaybackStopReport, RemoteCommand},
 };
+
+const FONT_PREPARATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Player {
     client: Arc<JellyfinClient>,
@@ -213,6 +215,7 @@ impl Player {
             .clone();
         let start_ticks = request.start_position_ticks.unwrap_or(0).max(0);
 
+        info!(%item_id, "正在处理 Jellyfin 播放命令");
         self.stop_current(false).await;
         let item = self.client.item(&self.user_id, &item_id).await?;
         let info = self
@@ -277,22 +280,41 @@ impl Player {
             .transpose()?
             .flatten();
         let media_streams = source.media_streams.clone();
-        let needs_fonts = source.media_streams.iter().any(|stream| {
-            stream.stream_type == "Subtitle"
-                && stream.codec.as_deref().is_some_and(|codec| {
-                    codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa")
-                })
-        });
+        let needs_fonts =
+            selected_subtitle_needs_fonts(&source.media_streams, subtitle_stream_index);
         let font_directory = if needs_fonts {
-            self.client
-                .download_fonts(&item.id, &source_id, &source.media_attachments)
+            if let Some(subtitle_url) = subtitle_url.as_ref() {
+                match timeout(
+                    FONT_PREPARATION_TIMEOUT,
+                    self.client.download_fonts(
+                        &item.id,
+                        &source_id,
+                        &source.media_attachments,
+                        subtitle_url,
+                    ),
+                )
                 .await
+                {
+                    Ok(directory) => directory,
+                    Err(_) => {
+                        warn!(
+                            timeout_seconds = FONT_PREPARATION_TIMEOUT.as_secs(),
+                            "准备字幕字体超时，跳过字体并继续播放"
+                        );
+                        None
+                    }
+                }
+            } else {
+                warn!("所选 ASS/SSA 字幕没有可下载地址，跳过字体下载");
+                None
+            }
         } else {
             None
         };
         let mpv = match spawn_mpv(MpvLaunch {
             executable: self.mpv_path.clone(),
             extra_args: self.mpv_args.clone(),
+            window_title: item.name.clone(),
             url,
             headers,
             start_seconds: start_ticks as f64 / 10_000_000.0,
@@ -516,5 +538,44 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn selected_subtitle_needs_fonts(streams: &[MediaStream], selected_index: Option<i32>) -> bool {
+    selected_index
+        .and_then(|index| {
+            streams
+                .iter()
+                .find(|stream| stream.stream_type == "Subtitle" && stream.index == index)
+        })
+        .and_then(|stream| stream.codec.as_deref())
+        .is_some_and(|codec| codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepares_fonts_only_for_the_selected_ass_or_ssa_subtitle() {
+        let streams = vec![subtitle(2, "ass"), subtitle(3, "srt")];
+
+        assert!(!selected_subtitle_needs_fonts(&streams, None));
+        assert!(selected_subtitle_needs_fonts(&streams, Some(2)));
+        assert!(!selected_subtitle_needs_fonts(&streams, Some(3)));
+        assert!(!selected_subtitle_needs_fonts(&streams, Some(99)));
+    }
+
+    fn subtitle(index: i32, codec: &str) -> MediaStream {
+        MediaStream {
+            index,
+            stream_type: "Subtitle".to_owned(),
+            codec: Some(codec.to_owned()),
+            language: None,
+            display_title: None,
+            is_text_subtitle_stream: true,
+            delivery_method: None,
+            delivery_url: None,
+        }
     }
 }

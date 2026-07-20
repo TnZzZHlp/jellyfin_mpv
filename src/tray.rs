@@ -4,7 +4,7 @@ mod platform {
         mem::size_of,
         os::windows::process::CommandExt,
         path::{Path, PathBuf},
-        process::Command,
+        process::{Child, Command},
         ptr::{null, null_mut},
         sync::mpsc,
         thread::{self, JoinHandle},
@@ -51,6 +51,13 @@ mod platform {
         shutdown: CancellationToken,
         menu: isize,
         log_path: PathBuf,
+        log_processes: Vec<Child>,
+    }
+
+    impl Drop for TrayState {
+        fn drop(&mut self) {
+            terminate_processes(&mut self.log_processes);
+        }
     }
 
     impl TrayIcon {
@@ -164,6 +171,7 @@ mod platform {
             shutdown,
             menu: menu as isize,
             log_path,
+            log_processes: Vec::new(),
         });
         let state_ptr = Box::into_raw(state);
         let title = wide("Jellyfin MPV Cast");
@@ -236,10 +244,11 @@ mod platform {
                 0
             }
             WM_COMMAND if wparam & 0xffff == MENU_OPEN_LOG => {
-                if !state.is_null()
-                    && let Err(error) = unsafe { open_log_terminal(&(*state).log_path) }
-                {
-                    tracing::error!(%error, "打开日志终端失败");
+                if !state.is_null() {
+                    match unsafe { open_log_terminal(&(*state).log_path) } {
+                        Ok(process) => unsafe { (*state).log_processes.push(process) },
+                        Err(error) => tracing::error!(%error, "打开日志终端失败"),
+                    }
                 }
                 0
             }
@@ -296,7 +305,7 @@ mod platform {
         }
     }
 
-    fn open_log_terminal(log_path: &Path) -> Result<()> {
+    fn open_log_terminal(log_path: &Path) -> Result<Child> {
         Command::new("powershell.exe")
             .args([
                 "-NoLogo",
@@ -307,8 +316,22 @@ mod platform {
             .env("JELLYFIN_MPV_LOG_FILE", log_path)
             .creation_flags(CREATE_NEW_CONSOLE)
             .spawn()
-            .context("启动 PowerShell 日志终端失败")?;
-        Ok(())
+            .context("启动 PowerShell 日志终端失败")
+    }
+
+    pub(super) fn terminate_processes(processes: &mut Vec<Child>) {
+        for mut process in processes.drain(..) {
+            if process.try_wait().ok().flatten().is_some() {
+                continue;
+            }
+            match process.kill() {
+                Ok(()) => {
+                    let _ = process.wait();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+                Err(error) => tracing::warn!(%error, pid = process.id(), "关闭日志终端失败"),
+            }
+        }
     }
 
     fn wide(value: &str) -> Vec<u16> {
@@ -331,11 +354,13 @@ pub use platform::TrayIcon;
 
 #[cfg(all(test, windows))]
 mod tests {
-    use std::time::Duration;
+    use std::{os::windows::process::CommandExt, process::Command, time::Duration};
 
     use tokio_util::sync::CancellationToken;
 
-    use super::TrayIcon;
+    use super::{TrayIcon, platform::terminate_processes};
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     #[test]
     fn creates_and_removes_windows_tray_icon() {
@@ -355,6 +380,37 @@ mod tests {
         }
         assert!(shutdown.is_cancelled());
         tray.close();
+    }
+
+    #[test]
+    fn terminates_tracked_log_processes() {
+        let child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut processes = vec![child];
+
+        terminate_processes(&mut processes);
+
+        assert!(processes.is_empty());
+        assert!(
+            !powershell_process_exists(pid),
+            "被跟踪的日志终端进程仍在运行"
+        );
+    }
+
+    fn powershell_process_exists(pid: u32) -> bool {
+        Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }
 

@@ -17,6 +17,23 @@ pub enum RemoteCommand {
     SetSubtitle(Option<i32>),
 }
 
+impl RemoteCommand {
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Play(_) => "Play",
+            Self::Pause => "Pause",
+            Self::Resume => "Resume",
+            Self::TogglePause => "TogglePause",
+            Self::Stop => "Stop",
+            Self::Seek(_) => "Seek",
+            Self::SetVolume(_) => "SetVolume",
+            Self::Mute(_) => "Mute",
+            Self::ToggleMute => "ToggleMute",
+            Self::SetSubtitle(_) => "SetSubtitle",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlayRequest {
@@ -61,7 +78,7 @@ struct GeneralCommand {
 pub enum SocketAction {
     Command(RemoteCommand),
     ForceKeepAlive(u64),
-    Ignore,
+    Ignore(String),
 }
 
 pub fn parse_socket_message(text: &str) -> Result<SocketAction, serde_json::Error> {
@@ -84,7 +101,10 @@ pub fn parse_socket_message(text: &str) -> Result<SocketAction, serde_json::Erro
                 "Seek" => request.seek_position_ticks.map(RemoteCommand::Seek),
                 _ => None,
             };
-            Ok(command.map_or(SocketAction::Ignore, SocketAction::Command))
+            Ok(command.map_or_else(
+                || SocketAction::Ignore("Playstate".to_owned()),
+                SocketAction::Command,
+            ))
         }
         "GeneralCommand" => {
             let request: GeneralCommand = serde_json::from_value(envelope.data)?;
@@ -107,9 +127,12 @@ pub fn parse_socket_message(text: &str) -> Result<SocketAction, serde_json::Erro
                     .map(|index| RemoteCommand::SetSubtitle((index >= 0).then_some(index))),
                 _ => None,
             };
-            Ok(command.map_or(SocketAction::Ignore, SocketAction::Command))
+            Ok(command.map_or_else(
+                || SocketAction::Ignore("GeneralCommand".to_owned()),
+                SocketAction::Command,
+            ))
         }
-        _ => Ok(SocketAction::Ignore),
+        _ => Ok(SocketAction::Ignore(envelope.message_type)),
     }
 }
 

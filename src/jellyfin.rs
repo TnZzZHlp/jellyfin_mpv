@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -10,10 +11,10 @@ use reqwest::{
     Client, StatusCode,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, OnceCell, RwLock, mpsc},
+    sync::{Mutex, RwLock, mpsc},
     time::{Instant, interval_at, sleep},
 };
 use tokio_tungstenite::{
@@ -42,12 +43,12 @@ const CLIENT_NAME: &str = "Jellyfin MPV Cast";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FONT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_TOTAL_FONT_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_SUBTITLE_BYTES: u64 = 8 * 1024 * 1024;
 
 pub struct JellyfinClient {
     config: Config,
     auth: RwLock<AuthState>,
     reauthenticate: Mutex<()>,
-    fallback_fonts: OnceCell<Vec<CachedFont>>,
 }
 
 struct AuthState {
@@ -56,16 +57,30 @@ struct AuthState {
     generation: u64,
 }
 
-struct CachedFont {
-    file_name: String,
-    bytes: Vec<u8>,
+struct FontDirectoryGuard {
+    path: Option<PathBuf>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct FallbackFontFile {
-    name: String,
-    size: u64,
+impl FontDirectoryGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("字体目录尚未移交")
+    }
+
+    fn persist(mut self) -> PathBuf {
+        self.path.take().expect("字体目录尚未移交")
+    }
+}
+
+impl Drop for FontDirectoryGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
 }
 
 impl JellyfinClient {
@@ -81,7 +96,6 @@ impl JellyfinClient {
                 generation: 0,
             }),
             reauthenticate: Mutex::new(()),
-            fallback_fonts: OnceCell::new(),
         };
         Ok((client, user))
     }
@@ -307,49 +321,47 @@ impl JellyfinClient {
         item_id: &str,
         source_id: &str,
         attachments: &[MediaAttachment],
+        subtitle_url: &Url,
     ) -> Option<PathBuf> {
-        let fonts: Vec<(&MediaAttachment, &str)> = attachments
-            .iter()
-            .filter_map(|attachment| font_extension(attachment).map(|ext| (attachment, ext)))
-            .collect();
-        let fallback_fonts = match self
-            .fallback_fonts
-            .get_or_try_init(|| self.fetch_fallback_fonts())
-            .await
-        {
-            Ok(fonts) => fonts.as_slice(),
+        let required_fonts = match self.required_ass_fonts(subtitle_url).await {
+            Ok(fonts) => fonts,
             Err(error) => {
-                warn!(%error, "获取 Jellyfin 服务器备用字体失败");
-                &[]
+                warn!(%error, "无法分析 ASS/SSA 字幕所需字体");
+                return None;
             }
         };
-        if fonts.is_empty() && fallback_fonts.is_empty() {
+        if required_fonts.is_empty() {
+            debug!("ASS/SSA 字幕没有声明字体，跳过字体下载");
+            return None;
+        }
+        let mut required_font_names = required_fonts.iter().cloned().collect::<Vec<_>>();
+        required_font_names.sort_unstable();
+        info!(fonts = ?required_font_names, "已解析 ASS/SSA 字幕所需字体");
+        let fonts: Vec<(&MediaAttachment, &str)> = attachments
+            .iter()
+            .filter(|attachment| {
+                attachment
+                    .file_name
+                    .as_deref()
+                    .is_some_and(|name| font_file_is_required(name, &required_fonts))
+            })
+            .filter_map(|attachment| font_extension(attachment).map(|ext| (attachment, ext)))
+            .collect();
+        if fonts.is_empty() {
+            debug!("媒体中没有与字幕声明匹配的字体附件");
             return None;
         }
 
-        let directory = std::env::temp_dir().join(format!("jellyfin-mpv-fonts-{}", Uuid::new_v4()));
-        if let Err(error) = tokio::fs::create_dir(&directory).await {
-            warn!(%error, path = %directory.display(), "无法创建字幕字体临时目录");
+        let directory_path =
+            std::env::temp_dir().join(format!("jellyfin-mpv-fonts-{}", Uuid::new_v4()));
+        if let Err(error) = tokio::fs::create_dir(&directory_path).await {
+            warn!(%error, path = %directory_path.display(), "无法创建字幕字体临时目录");
             return None;
         }
+        let directory = FontDirectoryGuard::new(directory_path);
 
         let mut total_bytes = 0_u64;
         let mut downloaded = 0_usize;
-        for font in fallback_fonts {
-            let length = font.bytes.len() as u64;
-            if total_bytes.saturating_add(length) > MAX_TOTAL_FONT_BYTES {
-                warn!("服务器备用字体总量超过 128 MiB，忽略剩余字体");
-                break;
-            }
-            let path = directory.join(&font.file_name);
-            match tokio::fs::write(&path, &font.bytes).await {
-                Ok(()) => {
-                    downloaded += 1;
-                    total_bytes += length;
-                }
-                Err(error) => warn!(%error, path = %path.display(), "写入服务器备用字体失败"),
-            }
-        }
         for (attachment, extension) in fonts {
             match self
                 .download_font(
@@ -357,7 +369,7 @@ impl JellyfinClient {
                     source_id,
                     attachment,
                     extension,
-                    &directory,
+                    directory.path(),
                     &mut total_bytes,
                 )
                 .await
@@ -373,15 +385,30 @@ impl JellyfinClient {
         }
 
         if downloaded == 0 {
-            let _ = tokio::fs::remove_dir_all(&directory).await;
             return None;
         }
         info!(
             downloaded,
             bytes = total_bytes,
-            "Jellyfin 备用字幕字体已就绪"
+            required = required_fonts.len(),
+            "Jellyfin 所需字幕字体已就绪"
         );
-        Some(directory)
+        Some(directory.persist())
+    }
+
+    async fn required_ass_fonts(&self, subtitle_url: &Url) -> Result<HashSet<String>> {
+        let response = ensure_success(self.get_authenticated(subtitle_url.clone()).await?).await?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_SUBTITLE_BYTES)
+        {
+            bail!("字幕文件超过 8 MiB 限制");
+        }
+        let bytes = response.bytes().await.context("读取 ASS/SSA 字幕失败")?;
+        if bytes.len() as u64 > MAX_SUBTITLE_BYTES {
+            bail!("字幕文件超过 8 MiB 限制");
+        }
+        Ok(parse_ass_font_names(&String::from_utf8_lossy(&bytes)))
     }
 
     async fn download_font(
@@ -426,75 +453,6 @@ impl JellyfinClient {
             .context("写入字体附件失败")?;
         *total_bytes += length;
         Ok(path)
-    }
-
-    async fn fetch_fallback_fonts(&self) -> Result<Vec<CachedFont>> {
-        let files: Vec<FallbackFontFile> = self
-            .get_json(self.endpoint(&["FallbackFont", "Fonts"])?)
-            .await?;
-        let mut fonts = Vec::new();
-        let mut total_bytes = 0_u64;
-        for file in files {
-            let Some(extension) = Path::new(&file.name)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .and_then(supported_font_extension)
-            else {
-                continue;
-            };
-            if file.size == 0 || file.size > MAX_FONT_BYTES {
-                warn!(name = %file.name, size = file.size, "忽略大小异常的服务器备用字体");
-                continue;
-            }
-            if total_bytes.saturating_add(file.size) > MAX_TOTAL_FONT_BYTES {
-                warn!("服务器备用字体总量超过 128 MiB，忽略剩余字体");
-                break;
-            }
-
-            let response = match self
-                .get_authenticated(self.endpoint(&["FallbackFont", "Fonts", &file.name])?)
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    warn!(name = %file.name, %error, "下载服务器备用字体失败");
-                    continue;
-                }
-            };
-            let response = match ensure_success(response).await {
-                Ok(response) => response,
-                Err(error) => {
-                    warn!(name = %file.name, %error, "下载服务器备用字体失败");
-                    continue;
-                }
-            };
-            let bytes = match response.bytes().await {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    warn!(name = %file.name, %error, "读取服务器备用字体失败");
-                    continue;
-                }
-            };
-            let length = bytes.len() as u64;
-            if length == 0
-                || length > MAX_FONT_BYTES
-                || total_bytes.saturating_add(length) > MAX_TOTAL_FONT_BYTES
-            {
-                warn!(name = %file.name, size = length, "忽略大小异常的服务器备用字体");
-                continue;
-            }
-            fonts.push(CachedFont {
-                file_name: format!("fallback-{}.{}", safe_file_stem(&file.name), extension),
-                bytes: bytes.to_vec(),
-            });
-            total_bytes += length;
-        }
-        info!(
-            count = fonts.len(),
-            bytes = total_bytes,
-            "已缓存 Jellyfin 服务器备用字体"
-        );
-        Ok(fonts)
     }
 
     pub async fn mpv_http_headers(
@@ -599,6 +557,7 @@ impl JellyfinClient {
                     match message.context("读取 WebSocket 消息失败")? {
                         Message::Text(text) => match parse_socket_message(&text) {
                             Ok(SocketAction::Command(command)) => {
+                                info!(command = command.name(), "收到 Jellyfin 远程命令");
                                 if commands.send(command).await.is_err() {
                                     return Ok(());
                                 }
@@ -608,12 +567,21 @@ impl JellyfinClient {
                                 let period = Duration::from_secs((timeout_seconds / 2).max(1));
                                 keepalive = interval_at(Instant::now() + period, period);
                                 keepalive_enabled = true;
+                                info!(period_seconds = period.as_secs(), "Jellyfin WebSocket KeepAlive 已启用");
                             }
-                            Ok(SocketAction::Ignore) => debug!("忽略未支持的 Jellyfin WebSocket 消息"),
+                            Ok(SocketAction::Ignore(message_type)) => {
+                                debug!(%message_type, "忽略未支持的 Jellyfin WebSocket 消息");
+                            }
                             Err(error) => error!(%error, "无法解析 Jellyfin WebSocket 消息"),
                         },
                         Message::Ping(data) => socket.send(Message::Pong(data)).await?,
-                        Message::Close(_) => return Ok(()),
+                        Message::Close(frame) => {
+                            warn!(?frame, "Jellyfin WebSocket 收到关闭帧");
+                            return Ok(());
+                        }
+                        Message::Binary(data) => {
+                            warn!(bytes = data.len(), "收到未支持的 Jellyfin WebSocket 二进制消息");
+                        }
                         _ => {}
                     }
                 }
@@ -726,6 +694,111 @@ fn supported_font_extension(extension: &str) -> Option<&'static str> {
     ["ttf", "otf", "ttc", "otc", "woff", "woff2"]
         .into_iter()
         .find(|supported| extension.eq_ignore_ascii_case(supported))
+}
+
+fn parse_ass_font_names(text: &str) -> HashSet<String> {
+    let mut fonts = HashSet::new();
+    let mut in_style_section = false;
+    let mut font_name_index = 1_usize;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim().trim_start_matches('\u{feff}');
+        if line.starts_with('[') && line.ends_with(']') {
+            in_style_section = line.eq_ignore_ascii_case("[V4 Styles]")
+                || line.eq_ignore_ascii_case("[V4+ Styles]");
+            continue;
+        }
+
+        if in_style_section {
+            if let Some(format) = strip_ass_prefix(line, "Format:") {
+                if let Some(index) = format
+                    .split(',')
+                    .position(|field| field.trim().eq_ignore_ascii_case("Fontname"))
+                {
+                    font_name_index = index;
+                }
+            } else if let Some(style) = strip_ass_prefix(line, "Style:")
+                && let Some(font_name) = style.split(',').nth(font_name_index)
+            {
+                insert_ass_font_name(&mut fonts, font_name);
+            }
+        }
+
+        let mut remaining = line;
+        while let Some(position) = remaining.find("\\fn") {
+            let value = &remaining[position + 3..];
+            let end = value.find(['\\', '}']).unwrap_or(value.len());
+            insert_ass_font_name(&mut fonts, &value[..end]);
+            remaining = value.get(end.saturating_add(1)..).unwrap_or_default();
+        }
+    }
+
+    fonts
+}
+
+fn strip_ass_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = line.get(..prefix.len())?;
+    candidate
+        .eq_ignore_ascii_case(prefix)
+        .then_some(&line[prefix.len()..])
+}
+
+fn insert_ass_font_name(fonts: &mut HashSet<String>, value: &str) {
+    let name = value.trim().trim_start_matches('@').trim();
+    if !name.is_empty() {
+        fonts.insert(name.to_owned());
+    }
+}
+
+fn font_file_is_required(file_name: &str, required_fonts: &HashSet<String>) -> bool {
+    required_fonts
+        .iter()
+        .any(|font_name| font_file_matches_required(file_name, font_name))
+}
+
+fn font_file_matches_required(file_name: &str, required_font: &str) -> bool {
+    let candidate = normalize_font_name(&safe_file_stem(file_name));
+    let required = normalize_font_name(required_font);
+    !candidate.is_empty()
+        && !required.is_empty()
+        && (candidate == required
+            || candidate
+                .strip_prefix(&required)
+                .is_some_and(is_font_style_suffix))
+}
+
+fn normalize_font_name(name: &str) -> String {
+    name.trim_start_matches('@')
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_font_style_suffix(suffix: &str) -> bool {
+    matches!(
+        suffix,
+        "regular"
+            | "normal"
+            | "roman"
+            | "book"
+            | "medium"
+            | "light"
+            | "thin"
+            | "bold"
+            | "black"
+            | "heavy"
+            | "semibold"
+            | "demibold"
+            | "italic"
+            | "oblique"
+            | "bolditalic"
+            | "boldoblique"
+            | "condensed"
+            | "condensedregular"
+            | "condensedbold"
+            | "condenseditalic"
+    )
 }
 
 fn safe_font_file_name(attachment: &MediaAttachment, extension: &str) -> String {
@@ -990,6 +1063,39 @@ mod tests {
         assert_eq!(font_extension(&cover), None);
     }
 
+    #[test]
+    fn parses_ass_style_and_inline_font_names() {
+        let subtitle = r#"
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, Bold
+Style: Default, Noto Sans CJK SC, 20, 0
+[Events]
+Format: Layer, Start, End, Style, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,{\fnSource Han Sans CN}正文
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,{\fn@方正黑体\b1}竖排
+"#;
+
+        let fonts = parse_ass_font_names(subtitle);
+
+        assert!(fonts.contains("Noto Sans CJK SC"));
+        assert!(fonts.contains("Source Han Sans CN"));
+        assert!(fonts.contains("方正黑体"));
+        assert_eq!(fonts.len(), 3);
+    }
+
+    #[test]
+    fn matches_only_required_font_files_and_style_variants() {
+        let required = HashSet::from(["Noto Sans CJK SC".to_owned(), "方正黑体".to_owned()]);
+
+        assert!(font_file_is_required(
+            "NotoSansCJKSC-Regular.otf",
+            &required
+        ));
+        assert!(font_file_is_required("方正黑体.ttf", &required));
+        assert!(!font_file_is_required("NotoSerifCJKSC.otf", &required));
+        assert!(!font_file_is_required("Unneeded.ttf", &required));
+    }
+
     #[tokio::test]
     async fn downloads_font_attachment_from_jellyfin() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1000,7 +1106,10 @@ mod tests {
                     200,
                     r#"{"AccessToken":"token","User":{"Id":"user-1","Name":"Alice"}}"#,
                 ),
-                (200, "[]"),
+                (
+                    200,
+                    "[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default, Example, 20",
+                ),
                 (200, "fake-font-data"),
             ];
             let mut requests = Vec::new();
@@ -1036,8 +1145,9 @@ mod tests {
             mime_type: Some("font/ttf".to_owned()),
             delivery_url: None,
         };
+        let subtitle_url = client.endpoint(&["subtitle.ass"]).unwrap();
         let directory = client
-            .download_fonts("item-1", "source-1", &[attachment])
+            .download_fonts("item-1", "source-1", &[attachment], &subtitle_url)
             .await
             .unwrap();
         let bytes = tokio::fs::read(directory.join("4-Example.ttf"))
@@ -1047,61 +1157,8 @@ mod tests {
         tokio::fs::remove_dir_all(directory).await.unwrap();
 
         let requests = server.await.unwrap();
+        assert!(requests[1].starts_with("GET /subtitle.ass "));
         assert!(requests[2].starts_with("GET /Videos/item-1/source-1/Attachments/4 "));
-    }
-
-    #[tokio::test]
-    async fn downloads_and_caches_server_fallback_fonts() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let responses = [
-                (
-                    200,
-                    r#"{"AccessToken":"token","User":{"Id":"user-1","Name":"Alice"}}"#,
-                ),
-                (200, r#"[{"Name":"Fallback.ttf","Size":14}]"#),
-                (200, "fallback-font"),
-            ];
-            let mut requests = Vec::new();
-            for (status, body) in responses {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                requests.push(read_request(&mut stream).await);
-                write_response(&mut stream, status, body).await;
-            }
-            requests
-        });
-
-        let encoded = STANDARD.encode("password");
-        let config = ConfigArgs::try_parse_from([
-            "jellyfin-mpv",
-            "--server",
-            &format!("http://{address}"),
-            "--username",
-            "Alice",
-            "--password",
-            &encoded,
-            "--device-id",
-            "test-device",
-        ])
-        .unwrap()
-        .resolve()
-        .unwrap()
-        .unwrap();
-        let (client, _) = JellyfinClient::connect(config).await.unwrap();
-        let directory = client
-            .download_fonts("item-1", "source-1", &[])
-            .await
-            .unwrap();
-        let bytes = tokio::fs::read(directory.join("fallback-Fallback.ttf"))
-            .await
-            .unwrap();
-        assert_eq!(bytes, b"fallback-font");
-        tokio::fs::remove_dir_all(directory).await.unwrap();
-
-        let requests = server.await.unwrap();
-        assert!(requests[1].starts_with("GET /FallbackFont/Fonts "));
-        assert!(requests[2].starts_with("GET /FallbackFont/Fonts/Fallback.ttf "));
     }
 
     #[tokio::test]

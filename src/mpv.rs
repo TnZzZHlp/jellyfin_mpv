@@ -97,6 +97,7 @@ impl MpvHandle {
 pub struct MpvLaunch {
     pub executable: PathBuf,
     pub extra_args: Vec<OsString>,
+    pub window_title: String,
     pub url: Url,
     pub headers: Vec<String>,
     pub start_seconds: f64,
@@ -109,6 +110,7 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
     let MpvLaunch {
         executable,
         extra_args,
+        window_title,
         url,
         headers,
         start_seconds,
@@ -118,8 +120,9 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
     } = launch;
     let id = Uuid::new_v4();
     let ipc_path = ipc_path(id);
+    let window_maximized = window_maximized(&extra_args);
     let mut command = Command::new(&executable);
-    command.arg("--window-maximized=yes").args(extra_args);
+    command.args(window_args(&extra_args));
     if let Some(directory) = font_directory {
         command.arg(format!("--sub-fonts-dir={}", directory.to_string_lossy()));
     }
@@ -148,6 +151,8 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
             ipc_path.clone(),
             url,
             headers,
+            window_title,
+            window_maximized,
             start_seconds,
             subtitle_url,
             command_rx,
@@ -178,6 +183,24 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
     }
 }
 
+fn window_args(extra_args: &[OsString]) -> Vec<OsString> {
+    let mut args = vec![OsString::from("--window-maximized=yes")];
+    args.extend_from_slice(extra_args);
+    args
+}
+
+fn window_maximized(extra_args: &[OsString]) -> bool {
+    let mut maximized = true;
+    for argument in extra_args {
+        match argument.to_string_lossy().as_ref() {
+            "--window-maximized=yes" => maximized = true,
+            "--window-maximized=no" | "--no-window-maximized" => maximized = false,
+            _ => {}
+        }
+    }
+    maximized
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_actor(
     id: Uuid,
@@ -185,6 +208,8 @@ async fn run_actor(
     ipc_path: PathBuf,
     url: Url,
     headers: Vec<String>,
+    window_title: String,
+    window_maximized: bool,
     start_seconds: f64,
     subtitle_url: Option<Url>,
     mut commands: mpsc::Receiver<MpvCommand>,
@@ -200,6 +225,7 @@ async fn run_actor(
         json!({"command": ["set_property", "http-header-fields", headers]}),
     )
     .await?;
+    set_window_state(&mut writer, &window_title, window_maximized).await?;
     for (number, property) in ["time-pos", "pause", "mute", "volume"].iter().enumerate() {
         send_json(
             &mut writer,
@@ -240,6 +266,7 @@ async fn run_actor(
                             }
                         };
                         if value.get("event").and_then(Value::as_str) == Some("file-loaded") {
+                            set_window_state(&mut writer, &window_title, window_maximized).await?;
                             if start_seconds > 0.0 {
                                 send_json(
                                     &mut writer,
@@ -280,6 +307,24 @@ async fn run_actor(
         .send(MpvEvent::Terminated { id, failed: false })
         .await;
     Ok(())
+}
+
+async fn set_window_state<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    title: &str,
+    maximized: bool,
+) -> Result<()> {
+    send_json(
+        writer,
+        json!({"command": ["set_property", "force-media-title", title]}),
+    )
+    .await?;
+    send_json(writer, json!({"command": ["set_property", "title", title]})).await?;
+    send_json(
+        writer,
+        json!({"command": ["set_property", "window-maximized", maximized]}),
+    )
+    .await
 }
 
 async fn send_mpv_command<W: AsyncWrite + Unpin>(
@@ -395,6 +440,44 @@ mod tests {
     use tokio::io::{AsyncReadExt, duplex};
 
     use super::*;
+
+    #[test]
+    fn maximizes_by_default_and_allows_an_explicit_override() {
+        let args = window_args(&[OsString::from("--window-maximized=no")]);
+
+        assert_eq!(args[0], "--window-maximized=yes");
+        assert_eq!(args[1], "--window-maximized=no");
+        assert!(!window_maximized(&args));
+        assert!(window_maximized(&[]));
+    }
+
+    #[tokio::test]
+    async fn sets_media_and_window_titles_through_ipc() {
+        let (mut writer, mut reader) = duplex(1024);
+        set_window_state(&mut writer, "剧集名称 S01E02", true)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let messages: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            messages[0]["command"],
+            json!(["set_property", "force-media-title", "剧集名称 S01E02"])
+        );
+        assert_eq!(
+            messages[1]["command"],
+            json!(["set_property", "title", "剧集名称 S01E02"])
+        );
+        assert_eq!(
+            messages[2]["command"],
+            json!(["set_property", "window-maximized", true])
+        );
+    }
 
     #[tokio::test]
     async fn emits_http_header_update_command() {
