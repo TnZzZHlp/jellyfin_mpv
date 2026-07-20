@@ -153,28 +153,44 @@ async fn run_worker(
 ) {
     let output = directory.join("preview.bgra");
     let mut cache: Option<CachedTile> = None;
-    loop {
+    'worker: loop {
         tokio::select! {
-            () = cancellation.cancelled() => break,
+            () = cancellation.cancelled() => break 'worker,
             changed = receiver.changed() => {
                 if changed.is_err() {
-                    break;
+                    break 'worker;
                 }
             }
         }
 
-        let request = receiver.borrow_and_update().clone();
-        let Some(request) = request else {
+        let mut request = receiver.borrow_and_update().clone();
+        loop {
+            // uosc moves its thumbnail background immediately. Remove the old
+            // bitmap before preparing the new frame so it cannot remain behind
+            // at the previous cursor position while a tile is downloading.
             let _ = mpv.remove_overlay(OVERLAY_ID).await;
-            continue;
-        };
-        if let Err(error) = render_preview(
-            &client, &mpv, &profile, &request, &receiver, &output, &mut cache,
-        )
-        .await
-        {
-            warn!(%error, "显示 Jellyfin Trickplay 缩略图失败");
-            let _ = mpv.remove_overlay(OVERLAY_ID).await;
+
+            let Some(current) = request.as_ref() else {
+                break;
+            };
+            tokio::select! {
+                () = cancellation.cancelled() => break 'worker,
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        break 'worker;
+                    }
+                    request = receiver.borrow_and_update().clone();
+                }
+                result = render_preview(
+                    &client, &mpv, &profile, current, &output, &mut cache,
+                ) => {
+                    if let Err(error) = result {
+                        warn!(%error, "显示 Jellyfin Trickplay 缩略图失败");
+                        let _ = mpv.remove_overlay(OVERLAY_ID).await;
+                    }
+                    break;
+                }
+            }
         }
     }
     let _ = mpv.remove_overlay(OVERLAY_ID).await;
@@ -185,7 +201,6 @@ async fn render_preview(
     mpv: &MpvHandle,
     profile: &TrickplayProfile,
     request: &MpvPreviewRequest,
-    receiver: &watch::Receiver<Option<MpvPreviewRequest>>,
     output: &PathBuf,
     cache: &mut Option<CachedTile>,
 ) -> Result<()> {
@@ -203,9 +218,6 @@ async fn render_preview(
         .await
         .context("下载 Trickplay 雪碧图超时")??
         .ok_or_else(|| anyhow!("Jellyfin 没有返回雪碧图 {}", location.tile_index))?;
-        if receiver.has_changed().unwrap_or(false) {
-            return Ok(());
-        }
         let image = tokio::task::spawn_blocking(move || decode_jpeg(&bytes))
             .await
             .context("Trickplay JPEG 解码任务异常退出")??;
@@ -215,17 +227,11 @@ async fn render_preview(
         });
     }
 
-    if receiver.has_changed().unwrap_or(false) {
-        return Ok(());
-    }
     let tile = cache.as_ref().expect("雪碧图缓存已准备");
     let pixels = crop_bgra(&tile.image, &profile.info, location)?;
     tokio::fs::write(output, pixels)
         .await
         .context("写入 mpv 缩略图像素失败")?;
-    if receiver.has_changed().unwrap_or(false) {
-        return Ok(());
-    }
 
     let (x, y, width, height) = fit_destination(request, &profile.info);
     mpv.add_overlay(Overlay {
