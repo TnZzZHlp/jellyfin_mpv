@@ -8,11 +8,13 @@ pub enum RemoteCommand {
     Play(PlayRequest),
     Pause,
     Resume,
+    TogglePause,
     Stop,
     Seek(i64),
     SetVolume(f64),
     Mute(bool),
     ToggleMute,
+    SetSubtitle(Option<i32>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +79,7 @@ pub fn parse_socket_message(text: &str) -> Result<SocketAction, serde_json::Erro
             let command = match request.command.as_str() {
                 "Pause" => Some(RemoteCommand::Pause),
                 "Unpause" => Some(RemoteCommand::Resume),
+                "PlayPause" => Some(RemoteCommand::TogglePause),
                 "Stop" => Some(RemoteCommand::Stop),
                 "Seek" => request.seek_position_ticks.map(RemoteCommand::Seek),
                 _ => None,
@@ -95,6 +98,13 @@ pub fn parse_socket_message(text: &str) -> Result<SocketAction, serde_json::Erro
                 "Mute" => Some(RemoteCommand::Mute(true)),
                 "Unmute" => Some(RemoteCommand::Mute(false)),
                 "ToggleMute" => Some(RemoteCommand::ToggleMute),
+                "SetSubtitleStreamIndex" => request
+                    .arguments
+                    .get("Index")
+                    .or_else(|| request.arguments.get("SubtitleStreamIndex"))
+                    .or_else(|| request.arguments.get("index"))
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .map(|index| RemoteCommand::SetSubtitle((index >= 0).then_some(index))),
                 _ => None,
             };
             Ok(command.map_or(SocketAction::Ignore, SocketAction::Command))
@@ -147,7 +157,36 @@ pub struct MediaSource {
     pub default_audio_stream_index: Option<i32>,
     pub default_subtitle_stream_index: Option<i32>,
     #[serde(default)]
+    pub media_streams: Vec<MediaStream>,
+    #[serde(default)]
+    pub media_attachments: Vec<MediaAttachment>,
+    #[serde(default)]
     pub required_http_headers: HashMap<String, Option<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaAttachment {
+    pub index: i32,
+    pub codec: Option<String>,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub delivery_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaStream {
+    pub index: i32,
+    #[serde(rename = "Type")]
+    pub stream_type: String,
+    pub codec: Option<String>,
+    pub language: Option<String>,
+    pub display_title: Option<String>,
+    #[serde(default)]
+    pub is_text_subtitle_stream: bool,
+    pub delivery_method: Option<String>,
+    pub delivery_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -206,6 +245,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_pause_resume_and_toggle() {
+        for (command, expected) in [
+            ("Pause", RemoteCommand::Pause),
+            ("Unpause", RemoteCommand::Resume),
+            ("PlayPause", RemoteCommand::TogglePause),
+        ] {
+            let message =
+                format!(r#"{{"MessageType":"Playstate","Data":{{"Command":"{command}"}}}}"#);
+            let SocketAction::Command(actual) = parse_socket_message(&message).unwrap() else {
+                panic!("未解析为播放状态命令");
+            };
+            assert_eq!(
+                std::mem::discriminant(&actual),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
     fn parses_volume_and_mute() {
         let volume = r#"{"MessageType":"GeneralCommand","Data":{"Name":"SetVolume","Arguments":{"Volume":"37"}}}"#;
         assert!(matches!(
@@ -226,6 +284,21 @@ mod tests {
         assert!(matches!(
             parse_socket_message(keepalive).unwrap(),
             SocketAction::ForceKeepAlive(60)
+        ));
+    }
+
+    #[test]
+    fn parses_subtitle_selection_and_disable() {
+        let select = r#"{"MessageType":"GeneralCommand","Data":{"Name":"SetSubtitleStreamIndex","Arguments":{"Index":"4"}}}"#;
+        assert!(matches!(
+            parse_socket_message(select).unwrap(),
+            SocketAction::Command(RemoteCommand::SetSubtitle(Some(4)))
+        ));
+
+        let disable = r#"{"MessageType":"GeneralCommand","Data":{"Name":"SetSubtitleStreamIndex","Arguments":{"Index":"-1"}}}"#;
+        assert!(matches!(
+            parse_socket_message(disable).unwrap(),
+            SocketAction::Command(RemoteCommand::SetSubtitle(None))
         ));
     }
 }

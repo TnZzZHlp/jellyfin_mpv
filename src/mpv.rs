@@ -33,11 +33,14 @@ pub enum MpvEvent {
 }
 
 enum MpvCommand {
+    Headers(Vec<String>),
     Pause(bool),
     Seek(f64),
     Volume(f64),
     Mute(bool),
     ToggleMute,
+    LoadSubtitle(String),
+    DisableSubtitle,
     Quit,
 }
 
@@ -47,6 +50,10 @@ pub struct MpvHandle {
 }
 
 impl MpvHandle {
+    pub async fn set_http_headers(&self, headers: Vec<String>) -> Result<()> {
+        self.send(MpvCommand::Headers(headers)).await
+    }
+
     pub async fn set_pause(&self, paused: bool) -> Result<()> {
         self.send(MpvCommand::Pause(paused)).await
     }
@@ -67,6 +74,14 @@ impl MpvHandle {
         self.send(MpvCommand::ToggleMute).await
     }
 
+    pub async fn load_subtitle(&self, url: Url) -> Result<()> {
+        self.send(MpvCommand::LoadSubtitle(url.into())).await
+    }
+
+    pub async fn disable_subtitle(&self) -> Result<()> {
+        self.send(MpvCommand::DisableSubtitle).await
+    }
+
     pub async fn quit(&self) -> Result<()> {
         self.send(MpvCommand::Quit).await
     }
@@ -79,19 +94,36 @@ impl MpvHandle {
     }
 }
 
-pub async fn spawn_mpv(
-    executable: PathBuf,
-    extra_args: Vec<OsString>,
-    url: Url,
-    headers: Vec<String>,
-    start_seconds: f64,
-    events: mpsc::Sender<MpvEvent>,
-) -> Result<MpvHandle> {
+pub struct MpvLaunch {
+    pub executable: PathBuf,
+    pub extra_args: Vec<OsString>,
+    pub url: Url,
+    pub headers: Vec<String>,
+    pub start_seconds: f64,
+    pub subtitle_url: Option<Url>,
+    pub font_directory: Option<PathBuf>,
+    pub events: mpsc::Sender<MpvEvent>,
+}
+
+pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
+    let MpvLaunch {
+        executable,
+        extra_args,
+        url,
+        headers,
+        start_seconds,
+        subtitle_url,
+        font_directory,
+        events,
+    } = launch;
     let id = Uuid::new_v4();
     let ipc_path = ipc_path(id);
     let mut command = Command::new(&executable);
+    command.arg("--window-maximized=yes").args(extra_args);
+    if let Some(directory) = font_directory {
+        command.arg(format!("--sub-fonts-dir={}", directory.to_string_lossy()));
+    }
     command
-        .args(extra_args)
         .arg("--idle=yes")
         .arg("--terminal=no")
         .arg("--input-terminal=no")
@@ -117,6 +149,7 @@ pub async fn spawn_mpv(
             url,
             headers,
             start_seconds,
+            subtitle_url,
             command_rx,
             events.clone(),
             &mut startup_tx,
@@ -153,6 +186,7 @@ async fn run_actor(
     url: Url,
     headers: Vec<String>,
     start_seconds: f64,
+    subtitle_url: Option<Url>,
     mut commands: mpsc::Receiver<MpvCommand>,
     events: mpsc::Sender<MpvEvent>,
     startup: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
@@ -212,6 +246,12 @@ async fn run_actor(
                                     json!({"command": ["seek", start_seconds, "absolute", "exact"]}),
                                 ).await?;
                             }
+                            if let Some(subtitle_url) = subtitle_url.as_ref() {
+                                send_json(
+                                    &mut writer,
+                                    json!({"command": ["sub-add", subtitle_url.as_str(), "select"]}),
+                                ).await?;
+                            }
                             let _ = events.send(MpvEvent::FileLoaded { id }).await;
                         } else if value.get("event").and_then(Value::as_str) == Some("property-change") {
                             emit_property(id, &value, &events).await;
@@ -247,6 +287,9 @@ async fn send_mpv_command<W: AsyncWrite + Unpin>(
     command: MpvCommand,
 ) -> Result<()> {
     let value = match command {
+        MpvCommand::Headers(headers) => {
+            json!({"command": ["set_property", "http-header-fields", headers]})
+        }
         MpvCommand::Pause(paused) => json!({"command": ["set_property", "pause", paused]}),
         MpvCommand::Seek(seconds) => {
             json!({"command": ["seek", seconds.max(0.0), "absolute", "exact"]})
@@ -256,6 +299,11 @@ async fn send_mpv_command<W: AsyncWrite + Unpin>(
         }
         MpvCommand::Mute(muted) => json!({"command": ["set_property", "mute", muted]}),
         MpvCommand::ToggleMute => json!({"command": ["cycle", "mute"]}),
+        MpvCommand::LoadSubtitle(url) => {
+            send_json(writer, json!({"command": ["sub-remove"]})).await?;
+            json!({"command": ["sub-add", url, "select"]})
+        }
+        MpvCommand::DisableSubtitle => json!({"command": ["set_property", "sid", "no"]}),
         MpvCommand::Quit => json!({"command": ["quit"]}),
     };
     send_json(writer, value).await
@@ -340,4 +388,90 @@ async fn cleanup_ipc(path: &Path) {
 
     #[cfg(windows)]
     let _ = path;
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, duplex};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn emits_http_header_update_command() {
+        let (mut writer, mut reader) = duplex(1024);
+        send_mpv_command(
+            &mut writer,
+            MpvCommand::Headers(vec!["X-Emby-Token: new-token".to_owned()]),
+        )
+        .await
+        .unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let message: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(
+            message["command"],
+            json!([
+                "set_property",
+                "http-header-fields",
+                ["X-Emby-Token: new-token"]
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn emits_subtitle_load_and_disable_commands() {
+        let (mut writer, mut reader) = duplex(1024);
+        send_mpv_command(
+            &mut writer,
+            MpvCommand::LoadSubtitle("http://example/subtitle.srt".to_owned()),
+        )
+        .await
+        .unwrap();
+        send_mpv_command(&mut writer, MpvCommand::DisableSubtitle)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let messages: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["command"][0], "sub-remove");
+        assert_eq!(messages[1]["command"][0], "sub-add");
+        assert_eq!(messages[1]["command"][1], "http://example/subtitle.srt");
+        assert_eq!(messages[2]["command"][1], "sid");
+        assert_eq!(messages[2]["command"][2], "no");
+    }
+
+    #[tokio::test]
+    async fn emits_pause_and_resume_commands() {
+        let (mut writer, mut reader) = duplex(1024);
+        send_mpv_command(&mut writer, MpvCommand::Pause(true))
+            .await
+            .unwrap();
+        send_mpv_command(&mut writer, MpvCommand::Pause(false))
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let messages: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            messages[0]["command"],
+            json!(["set_property", "pause", true])
+        );
+        assert_eq!(
+            messages[1]["command"],
+            json!(["set_property", "pause", false])
+        );
+    }
 }

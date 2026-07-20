@@ -1,4 +1,4 @@
-use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow, bail};
 use tokio::{
@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::{
     jellyfin::JellyfinClient,
-    mpv::{MpvEvent, MpvHandle, spawn_mpv},
-    protocol::{PlayRequest, PlaybackReport, PlaybackStopReport, RemoteCommand},
+    mpv::{MpvEvent, MpvHandle, MpvLaunch, spawn_mpv},
+    protocol::{MediaStream, PlayRequest, PlaybackReport, PlaybackStopReport, RemoteCommand},
 };
 
 pub struct Player {
@@ -33,6 +33,10 @@ struct Playback {
     play_method: &'static str,
     audio_stream_index: Option<i32>,
     subtitle_stream_index: Option<i32>,
+    media_streams: Vec<MediaStream>,
+    font_directory: Option<PathBuf>,
+    required_http_headers: HashMap<String, Option<String>>,
+    auth_generation: u64,
     position_ticks: i64,
     paused: bool,
     muted: bool,
@@ -92,6 +96,7 @@ impl Player {
         &mut self,
         mut commands: mpsc::Receiver<RemoteCommand>,
         mut mpv_events: mpsc::Receiver<MpvEvent>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let mut progress = interval(Duration::from_secs(5));
         progress.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -100,6 +105,10 @@ impl Player {
 
         loop {
             tokio::select! {
+                () = cancellation.cancelled() => {
+                    info!("收到托盘退出请求");
+                    break;
+                }
                 () = &mut shutdown => {
                     info!("收到退出信号");
                     break;
@@ -151,6 +160,15 @@ impl Player {
                 self.report_progress().await;
                 Ok(())
             }
+            RemoteCommand::TogglePause => {
+                let playback = self.active_mut()?;
+                let paused = !playback.paused;
+                playback.mpv.set_pause(paused).await?;
+                playback.paused = paused;
+                self.report_progress().await;
+                info!(paused, "播放暂停状态已切换");
+                Ok(())
+            }
             RemoteCommand::Seek(ticks) => {
                 let playback = self.active_mut()?;
                 let ticks = ticks.max(0);
@@ -181,6 +199,7 @@ impl Player {
                 self.report_progress().await;
                 Ok(())
             }
+            RemoteCommand::SetSubtitle(index) => self.set_subtitle(index).await,
         }
     }
 
@@ -234,22 +253,61 @@ impl Player {
             &play_session_id,
             source.transcoding_url.as_deref(),
         )?;
-        let headers = self.client.mpv_http_headers(&source.required_http_headers);
+        let (auth_generation, headers) = self
+            .client
+            .mpv_http_headers(&source.required_http_headers)
+            .await;
         let audio_stream_index = request
             .audio_stream_index
             .or(source.default_audio_stream_index);
-        let subtitle_stream_index = request
-            .subtitle_stream_index
-            .or(source.default_subtitle_stream_index);
-        let mpv = spawn_mpv(
-            self.mpv_path.clone(),
-            self.mpv_args.clone(),
+        let subtitle_stream_index = match request.subtitle_stream_index {
+            Some(index) => (index >= 0).then_some(index),
+            None => source
+                .default_subtitle_stream_index
+                .filter(|index| *index >= 0),
+        };
+        let subtitle_url = subtitle_stream_index
+            .and_then(|index| {
+                source
+                    .media_streams
+                    .iter()
+                    .find(|stream| stream.stream_type == "Subtitle" && stream.index == index)
+            })
+            .map(|stream| self.client.subtitle_url(&item.id, &source_id, stream))
+            .transpose()?
+            .flatten();
+        let media_streams = source.media_streams.clone();
+        let needs_fonts = source.media_streams.iter().any(|stream| {
+            stream.stream_type == "Subtitle"
+                && stream.codec.as_deref().is_some_and(|codec| {
+                    codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa")
+                })
+        });
+        let font_directory = if needs_fonts {
+            self.client
+                .download_fonts(&item.id, &source_id, &source.media_attachments)
+                .await
+        } else {
+            None
+        };
+        let mpv = match spawn_mpv(MpvLaunch {
+            executable: self.mpv_path.clone(),
+            extra_args: self.mpv_args.clone(),
             url,
             headers,
-            start_ticks as f64 / 10_000_000.0,
-            self.mpv_events.clone(),
-        )
-        .await?;
+            start_seconds: start_ticks as f64 / 10_000_000.0,
+            subtitle_url,
+            font_directory: font_directory.clone(),
+            events: self.mpv_events.clone(),
+        })
+        .await
+        {
+            Ok(mpv) => mpv,
+            Err(error) => {
+                cleanup_font_directory(font_directory.as_ref()).await;
+                return Err(error);
+            }
+        };
 
         info!(item = %item.name, item_id = %item.id, method = play_method, "正在启动播放");
         self.playback = Some(Playback {
@@ -262,12 +320,57 @@ impl Player {
             play_method,
             audio_stream_index,
             subtitle_stream_index,
+            media_streams,
+            font_directory,
+            required_http_headers: source.required_http_headers.clone(),
+            auth_generation,
             position_ticks: start_ticks,
             paused: false,
             muted: false,
             volume: 100.0,
             started: false,
         });
+        Ok(())
+    }
+
+    async fn set_subtitle(&mut self, index: Option<i32>) -> Result<()> {
+        let Some(index) = index else {
+            let playback = self.active_mut()?;
+            playback.mpv.disable_subtitle().await?;
+            playback.subtitle_stream_index = None;
+            self.report_progress().await;
+            info!("字幕已关闭");
+            return Ok(());
+        };
+
+        let (item_id, source_id, stream) = {
+            let playback = self.active_mut()?;
+            let stream = playback
+                .media_streams
+                .iter()
+                .find(|stream| stream.stream_type == "Subtitle" && stream.index == index)
+                .cloned()
+                .ok_or_else(|| anyhow!("找不到字幕流索引 {index}"))?;
+            (
+                playback.item_id.clone(),
+                playback.media_source_id.clone(),
+                stream,
+            )
+        };
+        let url = self
+            .client
+            .subtitle_url(&item_id, &source_id, &stream)?
+            .ok_or_else(|| anyhow!("字幕流 {index} 不能作为外部字幕加载"))?;
+        let playback = self.active_mut()?;
+        playback.mpv.load_subtitle(url).await?;
+        playback.subtitle_stream_index = Some(index);
+        let title = stream
+            .display_title
+            .as_deref()
+            .or(stream.language.as_deref())
+            .unwrap_or("未知字幕");
+        info!(index, title, "字幕已加载");
+        self.report_progress().await;
         Ok(())
     }
 
@@ -293,6 +396,7 @@ impl Player {
                     self.client.report_start(&playback.report()).await?;
                     info!(item = %playback.item_name, "播放已开始并上报 Jellyfin");
                 }
+                self.refresh_mpv_headers().await;
             }
             MpvEvent::Position { seconds, .. } => {
                 let playback = self.playback.as_mut().expect("已核对播放 ID");
@@ -318,7 +422,7 @@ impl Player {
         Ok(())
     }
 
-    async fn report_progress(&self) {
+    async fn report_progress(&mut self) {
         let Some(playback) = &self.playback else {
             return;
         };
@@ -327,7 +431,29 @@ impl Player {
         }
         if let Err(error) = self.client.report_progress(&playback.report()).await {
             warn!(%error, "上报 Jellyfin 播放进度失败");
+            return;
         }
+        self.refresh_mpv_headers().await;
+    }
+
+    async fn refresh_mpv_headers(&mut self) {
+        let Some(playback) = self.playback.as_ref() else {
+            return;
+        };
+        let current_generation = playback.auth_generation;
+        let required = playback.required_http_headers.clone();
+        let (generation, headers) = self.client.mpv_http_headers(&required).await;
+        if generation == current_generation {
+            return;
+        }
+
+        let playback = self.playback.as_mut().expect("播放状态仍然存在");
+        if let Err(error) = playback.mpv.set_http_headers(headers).await {
+            warn!(%error, "更新 mpv Access Token 请求头失败");
+            return;
+        }
+        playback.auth_generation = generation;
+        info!("mpv Access Token 请求头已更新");
     }
 
     async fn stop_current(&mut self, failed: bool) {
@@ -335,6 +461,7 @@ impl Player {
             return;
         };
         let _ = playback.mpv.quit().await;
+        cleanup_font_directory(playback.font_directory.as_ref()).await;
         if playback.started {
             if let Err(error) = self.client.report_stop(&playback.stop_report(failed)).await {
                 warn!(%error, "上报 Jellyfin 停止播放失败");
@@ -353,6 +480,25 @@ impl Player {
             bail!("mpv 尚未完成媒体加载");
         }
         Ok(playback)
+    }
+}
+
+async fn cleanup_font_directory(directory: Option<&PathBuf>) {
+    let Some(directory) = directory else {
+        return;
+    };
+    for attempt in 0..10 {
+        match tokio::fs::remove_dir_all(directory).await {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 9 => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                warn!(%error, path = %directory.display(), "清理字幕字体临时目录失败");
+                return;
+            }
+        }
     }
 }
 
