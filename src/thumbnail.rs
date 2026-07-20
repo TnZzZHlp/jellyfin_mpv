@@ -1,8 +1,13 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::{StreamExt, stream};
 use image::{ImageFormat, RgbImage};
-use tokio::{sync::watch, task::JoinHandle, time::timeout};
+use tokio::{
+    sync::{OnceCell, watch},
+    task::JoinHandle,
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -15,6 +20,7 @@ use crate::{
 const PREFERRED_THUMBNAIL_WIDTH: u32 = 320;
 const OVERLAY_ID: u32 = 47;
 const TILE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const TILE_PRELOAD_CONCURRENCY: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct TrickplayProfile {
@@ -73,6 +79,7 @@ pub struct ThumbnailWorker {
     sender: watch::Sender<Option<MpvPreviewRequest>>,
     cancellation: CancellationToken,
     task: JoinHandle<()>,
+    preload_task: JoinHandle<()>,
     directory: PathBuf,
 }
 
@@ -82,29 +89,34 @@ impl ThumbnailWorker {
         mpv: MpvHandle,
         profile: TrickplayProfile,
     ) -> Result<Self> {
+        let tile_count = tile_count(&profile.info)?;
         let directory = std::env::temp_dir().join(format!("jellyfin-mpv-thumbnails-{}", mpv.id));
         tokio::fs::create_dir(&directory)
             .await
             .with_context(|| format!("创建缩略图临时目录失败: {}", directory.display()))?;
         let (sender, receiver) = watch::channel(None);
         let cancellation = CancellationToken::new();
+        let store = Arc::new(TileStore::new(
+            client,
+            profile,
+            directory.clone(),
+            tile_count,
+        ));
+        let preload_store = Arc::clone(&store);
+        let preload_cancellation = cancellation.clone();
+        let preload_task = tokio::spawn(async move {
+            preload_tiles(preload_store, preload_cancellation).await;
+        });
         let worker_cancellation = cancellation.clone();
         let worker_directory = directory.clone();
         let task = tokio::spawn(async move {
-            run_worker(
-                client,
-                mpv,
-                profile,
-                receiver,
-                worker_cancellation,
-                worker_directory,
-            )
-            .await;
+            run_worker(store, mpv, receiver, worker_cancellation, worker_directory).await;
         });
         Ok(Self {
             sender,
             cancellation,
             task,
+            preload_task,
             directory,
         })
     }
@@ -116,6 +128,7 @@ impl ThumbnailWorker {
     pub async fn stop(self) {
         self.cancellation.cancel();
         let _ = self.task.await;
+        let _ = self.preload_task.await;
         if let Err(error) = tokio::fs::remove_dir_all(&self.directory).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -138,15 +151,110 @@ fn replace_request_if_changed(
     true
 }
 
+struct TileStore {
+    client: Arc<JellyfinClient>,
+    profile: TrickplayProfile,
+    directory: PathBuf,
+    entries: Vec<OnceCell<Option<PathBuf>>>,
+}
+
+impl TileStore {
+    fn new(
+        client: Arc<JellyfinClient>,
+        profile: TrickplayProfile,
+        directory: PathBuf,
+        tile_count: u32,
+    ) -> Self {
+        Self {
+            client,
+            profile,
+            directory,
+            entries: (0..tile_count).map(|_| OnceCell::new()).collect(),
+        }
+    }
+
+    fn tile_count(&self) -> u32 {
+        self.entries.len() as u32
+    }
+
+    async fn ensure_cached(&self, index: u32) -> Result<Option<PathBuf>> {
+        let entry = self
+            .entries
+            .get(index as usize)
+            .ok_or_else(|| anyhow!("Trickplay 雪碧图索引 {index} 超出范围"))?;
+        let cached = entry
+            .get_or_try_init(|| async {
+                let bytes = timeout(
+                    TILE_DOWNLOAD_TIMEOUT,
+                    self.client.trickplay_tile(
+                        &self.profile.item_id,
+                        &self.profile.media_source_id,
+                        self.profile.info.width,
+                        index,
+                    ),
+                )
+                .await
+                .context("下载 Trickplay 雪碧图超时")??;
+                let Some(bytes) = bytes else {
+                    return Ok::<_, anyhow::Error>(None);
+                };
+                let path = self.directory.join(format!("tile-{index}.jpg"));
+                tokio::fs::write(&path, bytes)
+                    .await
+                    .with_context(|| format!("缓存 Trickplay 雪碧图 {index} 失败"))?;
+                Ok(Some(path))
+            })
+            .await?;
+        Ok(cached.clone())
+    }
+
+    async fn read(&self, index: u32) -> Result<Option<Vec<u8>>> {
+        let Some(path) = self.ensure_cached(index).await? else {
+            return Ok(None);
+        };
+        tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("读取 Trickplay 雪碧图缓存 {} 失败", path.display()))
+            .map(Some)
+    }
+}
+
+async fn preload_tiles(store: Arc<TileStore>, cancellation: CancellationToken) {
+    let tile_count = store.tile_count();
+    let downloads = stream::iter(0..tile_count)
+        .map(|index| {
+            let store = Arc::clone(&store);
+            async move { (index, store.ensure_cached(index).await) }
+        })
+        .buffer_unordered(TILE_PRELOAD_CONCURRENCY);
+    tokio::pin!(downloads);
+
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            result = downloads.next() => {
+                let Some((index, result)) = result else {
+                    debug!(tiles = tile_count, "Trickplay 雪碧图后台预取完成");
+                    break;
+                };
+                match result {
+                    Ok(Some(_)) => debug!(tile = index, "Trickplay 雪碧图已预取"),
+                    Ok(None) => warn!(tile = index, "Jellyfin 没有返回预取的 Trickplay 雪碧图"),
+                    Err(error) => debug!(%error, tile = index, "预取 Trickplay 雪碧图失败，将在悬停时重试"),
+                }
+            }
+        }
+    }
+}
+
 struct CachedTile {
     index: u32,
     image: RgbImage,
 }
 
 async fn run_worker(
-    client: Arc<JellyfinClient>,
+    store: Arc<TileStore>,
     mpv: MpvHandle,
-    profile: TrickplayProfile,
     mut receiver: watch::Receiver<Option<MpvPreviewRequest>>,
     cancellation: CancellationToken,
     directory: PathBuf,
@@ -182,7 +290,7 @@ async fn run_worker(
                     request = receiver.borrow_and_update().clone();
                 }
                 result = render_preview(
-                    &client, &mpv, &profile, current, &output, &mut cache,
+                    &store, &mpv, current, &output, &mut cache,
                 ) => {
                     if let Err(error) = result {
                         warn!(%error, "显示 Jellyfin Trickplay 缩略图失败");
@@ -197,27 +305,19 @@ async fn run_worker(
 }
 
 async fn render_preview(
-    client: &JellyfinClient,
+    store: &TileStore,
     mpv: &MpvHandle,
-    profile: &TrickplayProfile,
     request: &MpvPreviewRequest,
     output: &PathBuf,
     cache: &mut Option<CachedTile>,
 ) -> Result<()> {
+    let profile = &store.profile;
     let location = frame_location(&profile.info, request.seconds)?;
     if cache.as_ref().map(|tile| tile.index) != Some(location.tile_index) {
-        let bytes = timeout(
-            TILE_DOWNLOAD_TIMEOUT,
-            client.trickplay_tile(
-                &profile.item_id,
-                &profile.media_source_id,
-                profile.info.width,
-                location.tile_index,
-            ),
-        )
-        .await
-        .context("下载 Trickplay 雪碧图超时")??
-        .ok_or_else(|| anyhow!("Jellyfin 没有返回雪碧图 {}", location.tile_index))?;
+        let bytes = store
+            .read(location.tile_index)
+            .await?
+            .ok_or_else(|| anyhow!("Jellyfin 没有返回雪碧图 {}", location.tile_index))?;
         let image = tokio::task::spawn_blocking(move || decode_jpeg(&bytes))
             .await
             .context("Trickplay JPEG 解码任务异常退出")??;
@@ -290,6 +390,17 @@ fn frame_location(info: &TrickplayInfo, seconds: f64) -> Result<FrameLocation> {
         column: within_tile % info.tile_width,
         row: within_tile / info.tile_width,
     })
+}
+
+fn tile_count(info: &TrickplayInfo) -> Result<u32> {
+    if !valid_info(info) {
+        bail!("Trickplay 元数据无效");
+    }
+    let per_tile = info
+        .tile_width
+        .checked_mul(info.tile_height)
+        .ok_or_else(|| anyhow!("Trickplay 雪碧图尺寸溢出"))?;
+    Ok(info.thumbnail_count.div_ceil(per_tile))
 }
 
 fn crop_bgra(tile: &RgbImage, info: &TrickplayInfo, location: FrameLocation) -> Result<Vec<u8>> {
@@ -385,6 +496,7 @@ mod tests {
     #[test]
     fn maps_hover_time_to_tile_and_cell_and_clamps_the_end() {
         let info = info(160);
+        assert_eq!(tile_count(&info).unwrap(), 3);
         assert_eq!(
             frame_location(&info, 130.0).unwrap(),
             FrameLocation {

@@ -129,11 +129,11 @@ cargo run --release -- --mpv-arg=--no-config --mpv-arg=--fullscreen
 
 ## 进度条缩略图
 
-程序读取媒体项目的 Jellyfin Trickplay 清单，并在鼠标悬停于 mpv 进度条时按需下载对应雪碧图。雪碧图使用当前登录会话鉴权，Access Token 不会写入图片 URL、mpv 参数或临时文件。
+程序读取媒体项目的 Jellyfin Trickplay 清单，播放开始后以最多两个并发请求在后台预取全部压缩雪碧图。鼠标先悬停到尚未预取的区域时会直接复用或发起该图片的下载，不必等待整个预取队列。雪碧图使用当前登录会话鉴权，Access Token 不会写入图片 URL、mpv 参数或临时文件。
 
 Jellyfin 服务器需要先在媒体库设置中启用并生成 Trickplay 图片。mpv 可使用支持 OSC Preview API 的新版内置 OSC，也可以使用 uosc 等兼容 thumbfast 消息协议的界面；程序会为每次播放自动加载桥接脚本，无需另行安装 `thumbfast.lua`。
 
-客户端只缓存当前使用的一张雪碧图，并把正在显示的单帧临时转换为 BGRA 覆盖层；播放结束后会删除桥接脚本和像素临时目录。没有 Trickplay 数据、图片下载失败或 mpv 界面不支持预览请求时保持普通播放，不影响播放控制。
+压缩 JPEG 缓存在当前播放的临时目录，内存只保留当前解码的一张雪碧图，并把正在显示的单帧临时转换为 BGRA 覆盖层；播放结束后会删除桥接脚本、JPEG 缓存和像素临时目录。没有 Trickplay 数据、图片下载失败或 mpv 界面不支持预览请求时保持普通播放，不影响播放控制。
 
 ## 修改服务器设置
 
