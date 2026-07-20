@@ -110,7 +110,7 @@ impl ThumbnailWorker {
     }
 
     pub fn request(&self, request: Option<MpvPreviewRequest>) {
-        self.sender.send_replace(request);
+        replace_request_if_changed(&self.sender, request);
     }
 
     pub async fn stop(self) {
@@ -122,6 +122,20 @@ impl ThumbnailWorker {
             warn!(%error, path = %self.directory.display(), "清理缩略图临时目录失败");
         }
     }
+}
+
+fn replace_request_if_changed(
+    sender: &watch::Sender<Option<MpvPreviewRequest>>,
+    request: Option<MpvPreviewRequest>,
+) -> bool {
+    // uosc sends the same `thumb` message on every render. Treating each copy as
+    // a new watch value keeps `has_changed()` permanently true and makes the
+    // worker discard every downloaded tile before it can reach overlay-add.
+    if *sender.borrow() == request {
+        return false;
+    }
+    sender.send_replace(request);
+    true
 }
 
 struct CachedTile {
@@ -410,5 +424,24 @@ mod tests {
             height: 200,
         };
         assert_eq!(fit_destination(&request, &info(160)), (100, 243, 200, 113));
+    }
+
+    #[test]
+    fn ignores_repeated_identical_preview_requests() {
+        let request = MpvPreviewRequest {
+            seconds: 25.0,
+            x: 100,
+            y: 200,
+            width: 320,
+            height: 180,
+        };
+        let (sender, mut receiver) = watch::channel(None);
+
+        assert!(replace_request_if_changed(&sender, Some(request.clone())));
+        assert!(receiver.has_changed().unwrap());
+        receiver.borrow_and_update();
+
+        assert!(!replace_request_if_changed(&sender, Some(request)));
+        assert!(!receiver.has_changed().unwrap());
     }
 }
