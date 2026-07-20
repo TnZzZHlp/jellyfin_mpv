@@ -302,7 +302,7 @@ mod platform {
                 "-NoLogo",
                 "-NoExit",
                 "-Command",
-                "$Host.UI.RawUI.WindowTitle='Jellyfin MPV 日志'; Get-Content -LiteralPath $env:JELLYFIN_MPV_LOG_FILE -Tail 200 -Wait",
+                "$Host.UI.RawUI.WindowTitle='Jellyfin MPV 日志'; $utf8 = New-Object System.Text.UTF8Encoding($false); [Console]::InputEncoding=$utf8; [Console]::OutputEncoding=$utf8; $OutputEncoding=$utf8; Get-Content -LiteralPath $env:JELLYFIN_MPV_LOG_FILE -Encoding UTF8 -Tail 200 -Wait",
             ])
             .env("JELLYFIN_MPV_LOG_FILE", log_path)
             .creation_flags(CREATE_NEW_CONSOLE)
