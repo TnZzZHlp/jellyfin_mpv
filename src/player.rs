@@ -11,10 +11,14 @@ use uuid::Uuid;
 use crate::{
     jellyfin::JellyfinClient,
     mpv::{MpvEvent, MpvHandle, MpvLaunch, spawn_mpv},
-    protocol::{MediaStream, PlayRequest, PlaybackReport, PlaybackStopReport, RemoteCommand},
+    protocol::{
+        MediaSegment, MediaStream, PlayRequest, PlaybackReport, PlaybackStopReport, RemoteCommand,
+    },
+    skip_settings::{SkipSettings, SkipSettingsStore},
 };
 
 const FONT_PREPARATION_TIMEOUT: Duration = Duration::from_secs(5);
+const MEDIA_SEGMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Player {
     client: Arc<JellyfinClient>,
@@ -22,6 +26,7 @@ pub struct Player {
     mpv_path: PathBuf,
     mpv_args: Vec<OsString>,
     mpv_events: mpsc::Sender<MpvEvent>,
+    skip_settings: Arc<SkipSettingsStore>,
     playback: Option<Playback>,
 }
 
@@ -44,6 +49,15 @@ struct Playback {
     muted: bool,
     volume: f64,
     started: bool,
+    skip_segments: Vec<SkipSegment>,
+}
+
+#[derive(Debug)]
+struct SkipSegment {
+    kind: String,
+    start_ticks: i64,
+    end_ticks: i64,
+    skipped: bool,
 }
 
 impl Playback {
@@ -83,6 +97,7 @@ impl Player {
         mpv_path: PathBuf,
         mpv_args: Vec<OsString>,
         mpv_events: mpsc::Sender<MpvEvent>,
+        skip_settings: Arc<SkipSettingsStore>,
     ) -> Self {
         Self {
             client,
@@ -90,6 +105,7 @@ impl Player {
             mpv_path,
             mpv_args,
             mpv_events,
+            skip_settings,
             playback: None,
         }
     }
@@ -176,6 +192,7 @@ impl Player {
                 let ticks = ticks.max(0);
                 playback.mpv.seek(ticks as f64 / 10_000_000.0).await?;
                 playback.position_ticks = ticks;
+                mark_passed_skip_segments(&mut playback.skip_segments, ticks);
                 self.report_progress().await;
                 Ok(())
             }
@@ -229,6 +246,22 @@ impl Player {
                 request.subtitle_stream_index,
             )
             .await?;
+        let skip_segments =
+            match timeout(MEDIA_SEGMENT_TIMEOUT, self.client.media_segments(&item_id)).await {
+                Ok(Ok(segments)) => prepare_skip_segments(segments, start_ticks),
+                Ok(Err(error)) => {
+                    warn!(%error, %item_id, "读取媒体分段失败，继续普通播放");
+                    Vec::new()
+                }
+                Err(_) => {
+                    warn!(
+                        %item_id,
+                        timeout_seconds = MEDIA_SEGMENT_TIMEOUT.as_secs(),
+                        "读取媒体分段超时，继续普通播放"
+                    );
+                    Vec::new()
+                }
+            };
         let source = request
             .media_source_id
             .as_deref()
@@ -351,6 +384,7 @@ impl Player {
             muted: false,
             volume: 100.0,
             started: false,
+            skip_segments,
         });
         Ok(())
     }
@@ -421,10 +455,7 @@ impl Player {
                 self.refresh_mpv_headers().await;
             }
             MpvEvent::Position { seconds, .. } => {
-                let playback = self.playback.as_mut().expect("已核对播放 ID");
-                if playback.started && seconds.is_finite() {
-                    playback.position_ticks = (seconds.max(0.0) * 10_000_000.0) as i64;
-                }
+                self.handle_position(seconds).await?;
             }
             MpvEvent::Paused { paused, .. } => {
                 self.playback.as_mut().expect("已核对播放 ID").paused = paused;
@@ -441,6 +472,40 @@ impl Player {
                 self.stop_current(failed).await;
             }
         }
+        Ok(())
+    }
+
+    async fn handle_position(&mut self, seconds: f64) -> Result<()> {
+        if !seconds.is_finite() {
+            return Ok(());
+        }
+
+        let position_ticks = (seconds.max(0.0) * 10_000_000.0) as i64;
+        let settings = self.skip_settings.snapshot();
+        let skip = {
+            let playback = self.playback.as_mut().expect("已核对播放 ID");
+            if !playback.started {
+                return Ok(());
+            }
+            playback.position_ticks = position_ticks;
+            next_skip_target(&mut playback.skip_segments, position_ticks, &settings)
+        };
+
+        let Some((kind, target_ticks)) = skip else {
+            return Ok(());
+        };
+        let playback = self.playback.as_mut().expect("播放状态仍然存在");
+        playback
+            .mpv
+            .seek(target_ticks as f64 / 10_000_000.0)
+            .await?;
+        playback.position_ticks = target_ticks;
+        info!(
+            segment_type = %kind,
+            target_seconds = target_ticks as f64 / 10_000_000.0,
+            "已自动跳过 Jellyfin 媒体分段"
+        );
+        self.report_progress().await;
         Ok(())
     }
 
@@ -552,9 +617,116 @@ fn selected_subtitle_needs_fonts(streams: &[MediaStream], selected_index: Option
         .is_some_and(|codec| codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa"))
 }
 
+fn prepare_skip_segments(segments: Vec<MediaSegment>, initial_ticks: i64) -> Vec<SkipSegment> {
+    let mut segments = segments
+        .into_iter()
+        .filter_map(|segment| {
+            let kind = segment.segment_type?;
+            if !SkipSettings::supports(&kind) {
+                return None;
+            }
+            let start_ticks = segment.start_ticks?.max(0);
+            let end_ticks = segment.end_ticks?;
+            (end_ticks > start_ticks).then_some(SkipSegment {
+                kind,
+                start_ticks,
+                end_ticks,
+                skipped: end_ticks <= initial_ticks,
+            })
+        })
+        .collect::<Vec<_>>();
+    segments.sort_unstable_by_key(|segment| segment.start_ticks);
+    segments
+}
+
+fn next_skip_target(
+    segments: &mut [SkipSegment],
+    position_ticks: i64,
+    settings: &SkipSettings,
+) -> Option<(String, i64)> {
+    // 如果用户直接拖到了某个分段之后，就把它视为已处理；之后手动回看时
+    // 不应再次把用户强制送到分段末尾。
+    mark_passed_skip_segments(segments, position_ticks);
+    let segment = segments.iter_mut().find(|segment| {
+        !segment.skipped
+            && settings.is_enabled(&segment.kind)
+            && position_ticks >= segment.start_ticks
+            && position_ticks < segment.end_ticks
+    })?;
+    segment.skipped = true;
+    Some((segment.kind.clone(), segment.end_ticks))
+}
+
+fn mark_passed_skip_segments(segments: &mut [SkipSegment], position_ticks: i64) {
+    for segment in segments.iter_mut() {
+        if segment.end_ticks <= position_ticks {
+            segment.skipped = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepares_and_skips_intro_and_outro_once() {
+        let settings = SkipSettings::default();
+        let mut segments = prepare_skip_segments(
+            vec![
+                media_segment("Outro", 900, 1_000),
+                media_segment("Commercial", 400, 500),
+                media_segment("Intro", 100, 200),
+                media_segment("Intro", 300, 300),
+            ],
+            0,
+        );
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].kind, "Intro");
+        assert_eq!(segments[1].kind, "Commercial");
+        assert_eq!(segments[2].kind, "Outro");
+        assert_eq!(
+            next_skip_target(&mut segments, 150, &settings),
+            Some(("Intro".to_owned(), 200))
+        );
+        assert_eq!(next_skip_target(&mut segments, 150, &settings), None);
+        assert_eq!(next_skip_target(&mut segments, 450, &settings), None);
+        assert_eq!(
+            next_skip_target(&mut segments, 950, &settings),
+            Some(("Outro".to_owned(), 1_000))
+        );
+    }
+
+    #[test]
+    fn does_not_auto_skip_segments_already_passed_at_resume_or_seek() {
+        let settings = SkipSettings::default();
+        let mut resumed = prepare_skip_segments(vec![media_segment("Intro", 100, 200)], 250);
+        assert_eq!(next_skip_target(&mut resumed, 150, &settings), None);
+
+        let mut sought_past = prepare_skip_segments(vec![media_segment("Intro", 100, 200)], 0);
+        assert_eq!(next_skip_target(&mut sought_past, 250, &settings), None);
+        assert_eq!(next_skip_target(&mut sought_past, 150, &settings), None);
+    }
+
+    #[test]
+    fn uses_updated_skip_type_choices() {
+        let mut segments = prepare_skip_segments(
+            vec![
+                media_segment("Recap", 100, 200),
+                media_segment("Commercial", 300, 400),
+            ],
+            0,
+        );
+        let mut settings = SkipSettings::default();
+        assert_eq!(next_skip_target(&mut segments, 150, &settings), None);
+
+        settings.recap = true;
+        assert_eq!(
+            next_skip_target(&mut segments, 150, &settings),
+            Some(("Recap".to_owned(), 200))
+        );
+    }
 
     #[test]
     fn prepares_fonts_only_for_the_selected_ass_or_ssa_subtitle() {
@@ -576,6 +748,14 @@ mod tests {
             is_text_subtitle_stream: true,
             delivery_method: None,
             delivery_url: None,
+        }
+    }
+
+    fn media_segment(kind: &str, start_ticks: i64, end_ticks: i64) -> MediaSegment {
+        MediaSegment {
+            segment_type: Some(kind.to_owned()),
+            start_ticks: Some(start_ticks),
+            end_ticks: Some(end_ticks),
         }
     }
 }

@@ -10,6 +10,7 @@
 - Access Token 被服务端注销或失效后，自动用用户名和密码重新登录并重试请求；
 - 接收播放、暂停、继续、停止、跳转、设置音量、静音和取消静音；
 - 加载 Jellyfin 选中的外部或文本型内嵌字幕，并支持播放中远程切换/关闭字幕；
+- 读取 Jellyfin 原生 `MediaSegments`，按设置自动跳过片头、片尾、前情回顾、预告或广告；
 - 分析当前 ASS/SSA 字幕声明的字体，并只下载媒体中名称匹配的 TTF/OTF/TTC/OTC/WOFF/WOFF2 字体附件；
 - 请求 `/Items/{itemId}/PlaybackInfo`，优先让 mpv 直接播放，必要时使用 Jellyfin 返回的转码流；
 - 为每次播放启动独立的外部 mpv，通过 JSON IPC 控制；
@@ -70,6 +71,7 @@ cargo run --release
 
 Windows 上连接成功后会显示托盘图标。单击或右键图标可打开菜单：
 
+- “设置...”可修改 Jellyfin 服务器地址、用户名、密码和自动跳过的分段类型；
 - “打开日志终端”会启动独立的 PowerShell 窗口，显示最近 200 行并实时跟踪新日志；
 - “退出”会停止当前 mpv、向 Jellyfin 上报停止并关闭后台任务。
 
@@ -115,6 +117,18 @@ cargo run --release -- --mpv-arg=--no-config --mpv-arg=--fullscreen
 如需关闭默认最大化，可传入 `--mpv-arg=--window-maximized=no`。
 
 设置 `RUST_LOG=jellyfin_mpv=debug` 可输出调试日志。通过登录窗口登录成功后，登录信息保存在 Windows 凭据管理器的 `jellyfin_mpv/login` 项中，不会写入明文配置文件或日志；完全通过命令行或环境变量登录不会改写该凭据。为了支持 Token 失效后自动登录，程序运行期间会在内存中保留解码后的密码。登录后取得的 Access Token 不会写入日志，也不会放入 mpv 命令行或媒体 URL；程序通过 mpv IPC 设置 HTTP 请求头，并在 Token 更新后同步更新 mpv。
+
+## 跳过媒体分段
+
+播放媒体时，程序会通过 `/MediaSegments/{itemId}` 请求 Jellyfin 10.10 及以上版本的原生媒体分段。托盘菜单的“设置...”页面可分别勾选片头 (`Intro`)、片尾 (`Outro`)、前情回顾 (`Recap`)、预告 (`Preview`) 和广告 (`Commercial`)；默认只勾选片头和片尾。勾选项保存到 `%LOCALAPPDATA%\jellyfin_mpv\settings.json` 并立即影响当前及后续播放。
+
+播放进入已勾选的有效分段后会自动跳到其结束时间并立即上报新进度；同一分段每次播放只自动跳过一次，因此手动回看不会反复触发。续播点或手动跳转已经越过的分段也不会在回看时自动跳过。
+
+分段数据需要先由 Jellyfin 媒体分段提供器生成；没有分段数据时保持普通播放。Jellyfin 10.9 及更早版本返回 404 时会自动兼容，不影响播放。
+
+## 修改服务器设置
+
+打开托盘菜单中的“设置...”，可修改服务器地址、用户名和密码。登录信息仍保存到 Windows 凭据管理器的 `jellyfin_mpv/login` 项，不会写入 `settings.json`。服务器或登录信息发生变化时，程序会停止当前播放、关闭旧 WebSocket 并连接新服务器；如果连接失败，会保留托盘和设置入口以便再次修改。
 
 ## 状态流
 

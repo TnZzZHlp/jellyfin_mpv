@@ -33,10 +33,11 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     protocol::{
-        AuthenticationResult, ItemDto, MediaAttachment, MediaStream, PlaybackInfoResponse,
-        PlaybackReport, PlaybackStopReport, RemoteCommand, SocketAction, UserDto,
-        parse_socket_message,
+        AuthenticationResult, ItemDto, MediaAttachment, MediaSegment, MediaSegmentQueryResult,
+        MediaStream, PlaybackInfoResponse, PlaybackReport, PlaybackStopReport, RemoteCommand,
+        SocketAction, UserDto, parse_socket_message,
     },
+    skip_settings::ALL_SEGMENT_TYPES_QUERY,
 };
 
 const CLIENT_NAME: &str = "Jellyfin MPV Cast";
@@ -190,6 +191,30 @@ impl JellyfinClient {
         self.get_json(self.endpoint(&["Users", user_id, "Items", item_id])?)
             .await
             .with_context(|| format!("获取媒体项目 {item_id} 失败"))
+    }
+
+    pub async fn media_segments(&self, item_id: &str) -> Result<Vec<MediaSegment>> {
+        let mut url = self.endpoint(&["MediaSegments", item_id])?;
+        url.query_pairs_mut()
+            .append_pair("includeSegmentTypes", ALL_SEGMENT_TYPES_QUERY);
+        let response = self
+            .get_authenticated(url)
+            .await
+            .with_context(|| format!("获取媒体分段 {item_id} 失败"))?;
+
+        // MediaSegments 是 Jellyfin 10.10 新增的接口。旧服务器没有该路由时，
+        // 保持普通播放，而不是让整个播放请求失败。
+        if response.status() == StatusCode::NOT_FOUND {
+            debug!(%item_id, "Jellyfin 服务器不支持媒体分段接口");
+            return Ok(Vec::new());
+        }
+
+        let result: MediaSegmentQueryResult = ensure_success(response)
+            .await?
+            .json()
+            .await
+            .context("解析 Jellyfin 媒体分段失败")?;
+        Ok(result.items)
     }
 
     pub async fn playback_info(
@@ -1042,6 +1067,72 @@ mod tests {
         assert_eq!(request.headers()["X-Emby-Token"], "fresh-token");
     }
 
+    #[tokio::test]
+    async fn requests_all_native_media_segments_and_accepts_legacy_404() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let responses = [
+                (
+                    200,
+                    r#"{"AccessToken":"token","User":{"Id":"user-1","Name":"Alice"}}"#,
+                ),
+                (404, ""),
+                (
+                    200,
+                    r#"{"Items":[{"Type":"Intro","StartTicks":100,"EndTicks":200},{"Type":"Outro","StartTicks":900,"EndTicks":1000}]}"#,
+                ),
+            ];
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut stream).await);
+                write_response(&mut stream, status, body).await;
+            }
+            requests
+        });
+
+        let encoded = STANDARD.encode("password");
+        let config = ConfigArgs::try_parse_from([
+            "jellyfin-mpv",
+            "--server",
+            &format!("http://{address}"),
+            "--username",
+            "Alice",
+            "--password",
+            &encoded,
+            "--device-id",
+            "test-device",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap()
+        .unwrap();
+        let (client, _) = JellyfinClient::connect(config).await.unwrap();
+
+        assert!(
+            client
+                .media_segments("legacy-item")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let segments = client.media_segments("item-1").await.unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].segment_type.as_deref(), Some("Intro"));
+        assert_eq!(segments[0].start_ticks, Some(100));
+        assert_eq!(segments[1].segment_type.as_deref(), Some("Outro"));
+
+        let requests = server.await.unwrap();
+        assert!(
+            requests[1]
+                .starts_with("GET /MediaSegments/legacy-item?includeSegmentTypes=Intro%2COutro%2CRecap%2CPreview%2CCommercial ")
+        );
+        assert!(
+            requests[2].starts_with("GET /MediaSegments/item-1?includeSegmentTypes=Intro%2COutro%2CRecap%2CPreview%2CCommercial ")
+        );
+    }
+
     #[test]
     fn recognizes_only_supported_font_attachments() {
         let font = MediaAttachment {
@@ -1253,7 +1344,12 @@ Dialogue: 0,0:00:01.00,0:00:02.00,Default,{\fn@方正黑体\b1}竖排
     }
 
     async fn write_response(stream: &mut TcpStream, status: u16, body: &str) {
-        let reason = if status == 200 { "OK" } else { "Unauthorized" };
+        let reason = match status {
+            200 => "OK",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            _ => "Error",
+        };
         let response = format!(
             "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 const CREDENTIAL_TARGET: &str = "jellyfin_mpv/login";
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SavedLogin {
     pub server: String,
     pub username: String,

@@ -21,7 +21,11 @@ pub fn show_error_message(message: &str) {
     platform::show_error(message);
 }
 
-fn validate_input(server: String, username: String, password: String) -> Result<LoginInput> {
+pub(crate) fn validate_input(
+    server: String,
+    username: String,
+    password: String,
+) -> Result<LoginInput> {
     let server_text = server.trim();
     if server_text.is_empty() {
         bail!("请输入 Jellyfin 地址");

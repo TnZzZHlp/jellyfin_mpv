@@ -201,7 +201,11 @@ impl Config {
     }
 
     pub fn login_to_save(&self) -> Option<SavedLogin> {
-        self.persist_login.then(|| SavedLogin {
+        self.persist_login.then(|| self.current_login())
+    }
+
+    pub fn current_login(&self) -> SavedLogin {
+        SavedLogin {
             server: self.server.to_string(),
             username: self
                 .username
@@ -213,7 +217,18 @@ impl Config {
                 .as_deref()
                 .expect("配置已 normalize")
                 .to_owned(),
-        })
+        }
+    }
+
+    pub fn apply_login(&mut self, login: SavedLogin) -> Result<()> {
+        let mut updated = self.clone();
+        updated.server = Url::parse(&login.server).context("设置中的 Jellyfin 地址格式不正确")?;
+        updated.username = Some(login.username);
+        updated.password = Some(login.password);
+        updated.persist_login = false;
+        updated.loaded_login = false;
+        *self = updated.normalize()?;
+        Ok(())
     }
 
     pub fn loaded_login(&self) -> bool {
@@ -289,6 +304,7 @@ mod tests {
     use clap::Parser;
 
     use super::ConfigArgs;
+    use crate::credential_store::SavedLogin;
 
     fn parse(args: &[&str]) -> ConfigArgs {
         ConfigArgs::try_parse_from(args).unwrap()
@@ -371,5 +387,34 @@ mod tests {
         assert!(error.contains("--server"));
         assert!(error.contains("--username"));
         assert!(error.contains("--password"));
+    }
+
+    #[test]
+    fn applies_server_login_from_the_settings_page() {
+        let encoded = STANDARD.encode("old-password");
+        let mut config = parse(&[
+            "jellyfin-mpv",
+            "--server",
+            "http://old.example:8096",
+            "--username",
+            "old-user",
+            "--password",
+            &encoded,
+        ])
+        .resolve()
+        .unwrap()
+        .unwrap();
+
+        config
+            .apply_login(SavedLogin {
+                server: "https://new.example/jellyfin".to_owned(),
+                username: " new-user ".to_owned(),
+                password: "new-password".to_owned(),
+            })
+            .unwrap();
+
+        assert_eq!(config.server.as_str(), "https://new.example/jellyfin/");
+        assert_eq!(config.username.as_deref(), Some("new-user"));
+        assert_eq!(config.password.as_deref(), Some("new-password"));
     }
 }

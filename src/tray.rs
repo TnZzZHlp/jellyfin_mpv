@@ -24,7 +24,7 @@ mod platform {
             WindowsAndMessaging::{
                 AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
                 DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos,
-                GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, IDI_APPLICATION, LoadIconW,
+                GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, IDI_APPLICATION, IsWindow, LoadIconW,
                 MF_DISABLED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
                 RegisterClassW, SW_HIDE, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
                 TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
@@ -34,11 +34,14 @@ mod platform {
         },
     };
 
+    use crate::settings_ui::{SettingsContext, show_settings};
+
     const WINDOW_CLASS: &str = "JellyfinMpvTrayWindow";
     const WM_TRAY: u32 = WM_APP + 1;
     const MENU_STATUS: usize = 1000;
     const MENU_OPEN_LOG: usize = 1001;
     const MENU_EXIT: usize = 1002;
+    const MENU_SETTINGS: usize = 1003;
     const ICON_ID: u32 = 1;
     const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
@@ -52,6 +55,8 @@ mod platform {
         menu: isize,
         log_path: PathBuf,
         log_processes: Vec<Child>,
+        settings: SettingsContext,
+        settings_open: bool,
     }
 
     impl Drop for TrayState {
@@ -65,11 +70,12 @@ mod platform {
             shutdown: CancellationToken,
             tooltip: String,
             log_path: PathBuf,
+            settings: SettingsContext,
         ) -> Result<Self> {
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let thread = thread::Builder::new()
                 .name("jellyfin-mpv-tray".to_owned())
-                .spawn(move || run_message_loop(shutdown, tooltip, log_path, ready_tx))
+                .spawn(move || run_message_loop(shutdown, tooltip, log_path, settings, ready_tx))
                 .context("创建托盘消息线程失败")?;
             let hwnd = ready_rx
                 .recv_timeout(Duration::from_secs(5))
@@ -115,9 +121,10 @@ mod platform {
         shutdown: CancellationToken,
         tooltip: String,
         log_path: PathBuf,
+        settings: SettingsContext,
         ready: mpsc::SyncSender<Result<isize, String>>,
     ) {
-        match unsafe { create_tray_window(shutdown, &tooltip, log_path) } {
+        match unsafe { create_tray_window(shutdown, &tooltip, log_path, settings) } {
             Ok(hwnd) => {
                 let _ = ready.send(Ok(hwnd as isize));
                 unsafe {
@@ -138,6 +145,7 @@ mod platform {
         shutdown: CancellationToken,
         tooltip: &str,
         log_path: PathBuf,
+        settings: SettingsContext,
     ) -> Result<HWND> {
         let instance = unsafe { GetModuleHandleW(null()) };
         if instance.is_null() {
@@ -158,10 +166,12 @@ mod platform {
         }
         let status = wide("Jellyfin MPV Cast 已连接");
         let open_log = wide("打开日志终端");
+        let settings_label = wide("设置...");
         let exit = wide("退出");
         unsafe {
             AppendMenuW(menu, MF_STRING | MF_DISABLED, MENU_STATUS, status.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            AppendMenuW(menu, MF_STRING, MENU_SETTINGS, settings_label.as_ptr());
             AppendMenuW(menu, MF_STRING, MENU_OPEN_LOG, open_log.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             AppendMenuW(menu, MF_STRING, MENU_EXIT, exit.as_ptr());
@@ -172,6 +182,8 @@ mod platform {
             menu: menu as isize,
             log_path,
             log_processes: Vec::new(),
+            settings,
+            settings_open: false,
         });
         let state_ptr = Box::into_raw(state);
         let title = wide("Jellyfin MPV Cast");
@@ -248,6 +260,24 @@ mod platform {
                     match unsafe { open_log_terminal(&(*state).log_path) } {
                         Ok(process) => unsafe { (*state).log_processes.push(process) },
                         Err(error) => tracing::error!(%error, "打开日志终端失败"),
+                    }
+                }
+                0
+            }
+            WM_COMMAND if wparam & 0xffff == MENU_SETTINGS => {
+                if !state.is_null() {
+                    if unsafe { (*state).settings_open } {
+                        return 0;
+                    }
+                    unsafe { (*state).settings_open = true };
+                    let context = unsafe { (*state).settings.clone() };
+                    if let Err(error) = show_settings(context) {
+                        tracing::error!(%error, "打开设置窗口失败");
+                    }
+                    if unsafe { IsWindow(hwnd) } == 0 {
+                        unsafe { PostQuitMessage(0) };
+                    } else {
+                        unsafe { (*state).settings_open = false };
                     }
                 }
                 0
@@ -354,21 +384,45 @@ pub use platform::TrayIcon;
 
 #[cfg(all(test, windows))]
 mod tests {
-    use std::{os::windows::process::CommandExt, process::Command, time::Duration};
+    use std::{
+        os::windows::process::CommandExt,
+        process::Command,
+        sync::{Arc, RwLock},
+        time::Duration,
+    };
 
     use tokio_util::sync::CancellationToken;
 
     use super::{TrayIcon, platform::terminate_processes};
+    use crate::{
+        credential_store::SavedLogin,
+        settings_ui::SettingsContext,
+        skip_settings::{SkipSettings, SkipSettingsStore},
+    };
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     #[test]
     fn creates_and_removes_windows_tray_icon() {
         let shutdown = CancellationToken::new();
+        let (connection_updates, _) = tokio::sync::mpsc::unbounded_channel();
+        let settings = SettingsContext {
+            login: Arc::new(RwLock::new(SavedLogin {
+                server: "http://localhost:8096/".to_owned(),
+                username: "test".to_owned(),
+                password: "test".to_owned(),
+            })),
+            skip_settings: Arc::new(SkipSettingsStore::for_test(
+                std::env::temp_dir().join("jellyfin-mpv-tray-test-settings.json"),
+                SkipSettings::default(),
+            )),
+            connection_updates,
+        };
         let tray = TrayIcon::start(
             shutdown.clone(),
             "Jellyfin MPV Cast 测试".to_owned(),
             std::env::temp_dir().join("jellyfin_mpv-test.log"),
+            settings,
         )
         .unwrap();
         tray.request_exit();
@@ -423,6 +477,7 @@ impl TrayIcon {
         _shutdown: tokio_util::sync::CancellationToken,
         _tooltip: String,
         _log_path: std::path::PathBuf,
+        _settings: crate::settings_ui::SettingsContext,
     ) -> anyhow::Result<Self> {
         Ok(Self)
     }

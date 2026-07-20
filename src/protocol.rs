@@ -160,6 +160,22 @@ pub struct ItemDto {
     pub media_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaSegment {
+    #[serde(rename = "Type")]
+    pub segment_type: Option<String>,
+    pub start_ticks: Option<i64>,
+    pub end_ticks: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaSegmentQueryResult {
+    #[serde(default)]
+    pub items: Vec<MediaSegment>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlaybackInfoResponse {
