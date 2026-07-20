@@ -10,6 +10,7 @@ mod protocol;
 mod settings_ui;
 mod single_instance;
 mod skip_settings;
+mod thumbnail;
 mod tray;
 
 use std::{

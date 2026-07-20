@@ -158,6 +158,20 @@ pub struct ItemDto {
     pub name: String,
     #[serde(default)]
     pub media_type: Option<String>,
+    #[serde(default)]
+    pub trickplay: HashMap<String, Option<HashMap<String, TrickplayInfo>>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+#[serde(rename_all = "PascalCase")]
+pub struct TrickplayInfo {
+    pub width: u32,
+    pub height: u32,
+    pub tile_width: u32,
+    pub tile_height: u32,
+    pub thumbnail_count: u32,
+    pub interval: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

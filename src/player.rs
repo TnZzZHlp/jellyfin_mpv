@@ -15,6 +15,7 @@ use crate::{
         MediaSegment, MediaStream, PlayRequest, PlaybackReport, PlaybackStopReport, RemoteCommand,
     },
     skip_settings::{SkipSettings, SkipSettingsStore},
+    thumbnail::{ThumbnailWorker, select_trickplay},
 };
 
 const FONT_PREPARATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -42,6 +43,7 @@ struct Playback {
     subtitle_stream_index: Option<i32>,
     media_streams: Vec<MediaStream>,
     font_directory: Option<PathBuf>,
+    thumbnail: Option<ThumbnailWorker>,
     required_http_headers: HashMap<String, Option<String>>,
     auth_generation: u64,
     position_ticks: i64,
@@ -313,6 +315,7 @@ impl Player {
             .transpose()?
             .flatten();
         let media_streams = source.media_streams.clone();
+        let trickplay = select_trickplay(&item, &source_id);
         let needs_fonts =
             selected_subtitle_needs_fonts(&source.media_streams, subtitle_stream_index);
         let font_directory = if needs_fonts {
@@ -353,6 +356,7 @@ impl Player {
             start_seconds: start_ticks as f64 / 10_000_000.0,
             subtitle_url,
             font_directory: font_directory.clone(),
+            thumbnail_size: trickplay.as_ref().map(|profile| profile.display_size()),
             events: self.mpv_events.clone(),
         })
         .await
@@ -362,6 +366,18 @@ impl Player {
                 cleanup_font_directory(font_directory.as_ref()).await;
                 return Err(error);
             }
+        };
+
+        let thumbnail = if let Some(profile) = trickplay {
+            match ThumbnailWorker::start(self.client.clone(), mpv.clone(), profile).await {
+                Ok(worker) => Some(worker),
+                Err(error) => {
+                    warn!(%error, %item_id, "初始化 Trickplay 缩略图失败，继续普通播放");
+                    None
+                }
+            }
+        } else {
+            None
         };
 
         info!(item = %item.name, item_id = %item.id, method = play_method, "正在启动播放");
@@ -377,6 +393,7 @@ impl Player {
             subtitle_stream_index,
             media_streams,
             font_directory,
+            thumbnail,
             required_http_headers: source.required_http_headers.clone(),
             auth_generation,
             position_ticks: start_ticks,
@@ -437,6 +454,7 @@ impl Player {
             | MpvEvent::Paused { id, .. }
             | MpvEvent::Muted { id, .. }
             | MpvEvent::Volume { id, .. }
+            | MpvEvent::Preview { id, .. }
             | MpvEvent::Ended { id, .. }
             | MpvEvent::Terminated { id, .. } => *id,
         };
@@ -466,6 +484,15 @@ impl Player {
             MpvEvent::Volume { volume, .. } => {
                 if volume.is_finite() {
                     self.playback.as_mut().expect("已核对播放 ID").volume = volume;
+                }
+            }
+            MpvEvent::Preview { request, .. } => {
+                if let Some(thumbnail) = self
+                    .playback
+                    .as_ref()
+                    .and_then(|playback| playback.thumbnail.as_ref())
+                {
+                    thumbnail.request(request);
                 }
             }
             MpvEvent::Ended { failed, .. } | MpvEvent::Terminated { failed, .. } => {
@@ -544,9 +571,12 @@ impl Player {
     }
 
     async fn stop_current(&mut self, failed: bool) {
-        let Some(playback) = self.playback.take() else {
+        let Some(mut playback) = self.playback.take() else {
             return;
         };
+        if let Some(thumbnail) = playback.thumbnail.take() {
+            thumbnail.stop().await;
+        }
         let _ = playback.mpv.quit().await;
         cleanup_font_directory(playback.font_directory.as_ref()).await;
         if playback.started {

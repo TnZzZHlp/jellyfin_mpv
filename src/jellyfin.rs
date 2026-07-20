@@ -37,7 +37,7 @@ use crate::{
         MediaStream, PlaybackInfoResponse, PlaybackReport, PlaybackStopReport, RemoteCommand,
         SocketAction, UserDto, parse_socket_message,
     },
-    skip_settings::ALL_SEGMENT_TYPES_QUERY,
+    skip_settings::ALL_SEGMENT_TYPES,
 };
 
 const CLIENT_NAME: &str = "Jellyfin MPV Cast";
@@ -45,6 +45,7 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FONT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_TOTAL_FONT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SUBTITLE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TRICKPLAY_TILE_BYTES: u64 = 32 * 1024 * 1024;
 
 pub struct JellyfinClient {
     config: Config,
@@ -188,15 +189,61 @@ impl JellyfinClient {
     }
 
     pub async fn item(&self, user_id: &str, item_id: &str) -> Result<ItemDto> {
-        self.get_json(self.endpoint(&["Users", user_id, "Items", item_id])?)
+        let mut url = self.endpoint(&["Users", user_id, "Items", item_id])?;
+        url.query_pairs_mut().append_pair("fields", "Trickplay");
+        self.get_json(url)
             .await
             .with_context(|| format!("获取媒体项目 {item_id} 失败"))
     }
 
+    pub async fn trickplay_tile(
+        &self,
+        item_id: &str,
+        media_source_id: &str,
+        width: u32,
+        index: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        let width = width.to_string();
+        let index = format!("{index}.jpg");
+        let mut url = self.endpoint(&["Videos", item_id, "Trickplay", &width, &index])?;
+        url.query_pairs_mut()
+            .append_pair("mediaSourceId", media_source_id);
+        let response = self
+            .get_authenticated(url)
+            .await
+            .with_context(|| format!("下载 Trickplay 雪碧图 {index} 失败"))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let mut response = ensure_success(response).await?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_TRICKPLAY_TILE_BYTES)
+        {
+            bail!("Trickplay 雪碧图超过 32 MiB 限制");
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("读取 Trickplay 雪碧图失败")?
+        {
+            if bytes.len() as u64 + chunk.len() as u64 > MAX_TRICKPLAY_TILE_BYTES {
+                bail!("Trickplay 雪碧图超过 32 MiB 限制");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Some(bytes))
+    }
+
     pub async fn media_segments(&self, item_id: &str) -> Result<Vec<MediaSegment>> {
         let mut url = self.endpoint(&["MediaSegments", item_id])?;
-        url.query_pairs_mut()
-            .append_pair("includeSegmentTypes", ALL_SEGMENT_TYPES_QUERY);
+        {
+            let mut query = url.query_pairs_mut();
+            for segment_type in ALL_SEGMENT_TYPES {
+                query.append_pair("includeSegmentTypes", segment_type);
+            }
+        }
         let response = self
             .get_authenticated(url)
             .await
@@ -1126,10 +1173,77 @@ mod tests {
         let requests = server.await.unwrap();
         assert!(
             requests[1]
-                .starts_with("GET /MediaSegments/legacy-item?includeSegmentTypes=Intro%2COutro%2CRecap%2CPreview%2CCommercial ")
+                .starts_with("GET /MediaSegments/legacy-item?includeSegmentTypes=Intro&includeSegmentTypes=Outro&includeSegmentTypes=Recap&includeSegmentTypes=Preview&includeSegmentTypes=Commercial ")
         );
         assert!(
-            requests[2].starts_with("GET /MediaSegments/item-1?includeSegmentTypes=Intro%2COutro%2CRecap%2CPreview%2CCommercial ")
+            requests[2].starts_with("GET /MediaSegments/item-1?includeSegmentTypes=Intro&includeSegmentTypes=Outro&includeSegmentTypes=Recap&includeSegmentTypes=Preview&includeSegmentTypes=Commercial ")
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_trickplay_metadata_and_authenticated_tile_image() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let responses = [
+                (
+                    200,
+                    r#"{"AccessToken":"token","User":{"Id":"user-1","Name":"Alice"}}"#,
+                ),
+                (
+                    200,
+                    r#"{"Id":"item-1","Name":"Movie","MediaType":"Video","Trickplay":{"source-1":{"320":{"Width":320,"Height":180,"TileWidth":10,"TileHeight":10,"ThumbnailCount":123,"Interval":10000}}}}"#,
+                ),
+                (200, "fake-jpeg-data"),
+            ];
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut stream).await);
+                write_response(&mut stream, status, body).await;
+            }
+            requests
+        });
+
+        let encoded = STANDARD.encode("password");
+        let config = ConfigArgs::try_parse_from([
+            "jellyfin-mpv",
+            "--server",
+            &format!("http://{address}"),
+            "--username",
+            "Alice",
+            "--password",
+            &encoded,
+            "--device-id",
+            "test-device",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap()
+        .unwrap();
+        let (client, _) = JellyfinClient::connect(config).await.unwrap();
+
+        let item = client.item("user-1", "item-1").await.unwrap();
+        let trickplay = item.trickplay["source-1"].as_ref().unwrap();
+        assert_eq!(trickplay["320"].width, 320);
+        assert_eq!(trickplay["320"].interval, 10_000);
+        let tile = client
+            .trickplay_tile("item-1", "source-1", 320, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tile, b"fake-jpeg-data");
+
+        let requests = server.await.unwrap();
+        assert!(requests[1].starts_with("GET /Users/user-1/Items/item-1?fields=Trickplay "));
+        assert!(
+            requests[2]
+                .starts_with("GET /Videos/item-1/Trickplay/320/2.jpg?mediaSourceId=source-1 ")
+        );
+        assert!(
+            requests[2]
+                .to_ascii_lowercase()
+                .contains("x-emby-token: token")
         );
     }
 

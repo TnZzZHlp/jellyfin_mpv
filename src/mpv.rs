@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
@@ -23,13 +24,58 @@ type IpcStream = Box<dyn AsyncIpc>;
 
 #[derive(Debug)]
 pub enum MpvEvent {
-    FileLoaded { id: Uuid },
-    Position { id: Uuid, seconds: f64 },
-    Paused { id: Uuid, paused: bool },
-    Muted { id: Uuid, muted: bool },
-    Volume { id: Uuid, volume: f64 },
-    Ended { id: Uuid, failed: bool },
-    Terminated { id: Uuid, failed: bool },
+    FileLoaded {
+        id: Uuid,
+    },
+    Position {
+        id: Uuid,
+        seconds: f64,
+    },
+    Paused {
+        id: Uuid,
+        paused: bool,
+    },
+    Muted {
+        id: Uuid,
+        muted: bool,
+    },
+    Volume {
+        id: Uuid,
+        volume: f64,
+    },
+    Preview {
+        id: Uuid,
+        request: Option<MpvPreviewRequest>,
+    },
+    Ended {
+        id: Uuid,
+        failed: bool,
+    },
+    Terminated {
+        id: Uuid,
+        failed: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MpvPreviewRequest {
+    pub seconds: f64,
+    pub x: i64,
+    pub y: i64,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug)]
+pub struct Overlay {
+    pub id: u32,
+    pub x: i64,
+    pub y: i64,
+    pub path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub display_width: u32,
+    pub display_height: u32,
 }
 
 enum MpvCommand {
@@ -41,9 +87,15 @@ enum MpvCommand {
     ToggleMute,
     LoadSubtitle(String),
     DisableSubtitle,
+    AddOverlay {
+        overlay: Overlay,
+        completed: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    RemoveOverlay(u32),
     Quit,
 }
 
+#[derive(Clone)]
 pub struct MpvHandle {
     pub id: Uuid,
     commands: mpsc::Sender<MpvCommand>,
@@ -82,6 +134,20 @@ impl MpvHandle {
         self.send(MpvCommand::DisableSubtitle).await
     }
 
+    pub async fn add_overlay(&self, overlay: Overlay) -> Result<()> {
+        let (completed, result) = oneshot::channel();
+        self.send(MpvCommand::AddOverlay { overlay, completed })
+            .await?;
+        result
+            .await
+            .map_err(|_| anyhow!("mpv 缩略图覆盖层命令意外中断"))?
+            .map_err(|message| anyhow!(message))
+    }
+
+    pub async fn remove_overlay(&self, id: u32) -> Result<()> {
+        self.send(MpvCommand::RemoveOverlay(id)).await
+    }
+
     pub async fn quit(&self) -> Result<()> {
         self.send(MpvCommand::Quit).await
     }
@@ -103,6 +169,7 @@ pub struct MpvLaunch {
     pub start_seconds: f64,
     pub subtitle_url: Option<Url>,
     pub font_directory: Option<PathBuf>,
+    pub thumbnail_size: Option<(u32, u32)>,
     pub events: mpsc::Sender<MpvEvent>,
 }
 
@@ -116,15 +183,34 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
         start_seconds,
         subtitle_url,
         font_directory,
+        mut thumbnail_size,
         events,
     } = launch;
     let id = Uuid::new_v4();
     let ipc_path = ipc_path(id);
     let window_maximized = window_maximized(&extra_args);
+    let thumbnail_script_directory = if thumbnail_size.is_some() {
+        match prepare_thumbnail_script(id).await {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                warn!(%error, "无法准备 mpv 缩略图桥接脚本，继续普通播放");
+                thumbnail_size = None;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut command = Command::new(&executable);
     command.args(window_args(&extra_args));
     if let Some(directory) = font_directory {
         command.arg(format!("--sub-fonts-dir={}", directory.to_string_lossy()));
+    }
+    if let Some(directory) = thumbnail_script_directory.as_ref() {
+        command.arg(format!(
+            "--script={}",
+            directory.join("thumbfast.lua").to_string_lossy()
+        ));
     }
     command
         .arg("--idle=yes")
@@ -137,9 +223,13 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    let child = command
-        .spawn()
-        .with_context(|| format!("无法启动 mpv: {}", executable.display()))?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            cleanup_thumbnail_script_directory(thumbnail_script_directory.as_deref()).await;
+            return Err(error).with_context(|| format!("无法启动 mpv: {}", executable.display()));
+        }
+    };
     let (command_tx, command_rx) = mpsc::channel(32);
     let (startup_tx, startup_rx) = oneshot::channel();
 
@@ -155,6 +245,7 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
             window_maximized,
             start_seconds,
             subtitle_url,
+            thumbnail_size,
             command_rx,
             events.clone(),
             &mut startup_tx,
@@ -170,6 +261,7 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
             }
         }
         cleanup_ipc(&ipc_path).await;
+        cleanup_thumbnail_script_directory(thumbnail_script_directory.as_deref()).await;
     });
 
     match timeout(Duration::from_secs(15), startup_rx).await {
@@ -212,6 +304,7 @@ async fn run_actor(
     window_maximized: bool,
     start_seconds: f64,
     subtitle_url: Option<Url>,
+    thumbnail_size: Option<(u32, u32)>,
     mut commands: mpsc::Receiver<MpvCommand>,
     events: mpsc::Sender<MpvEvent>,
     startup: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
@@ -219,6 +312,8 @@ async fn run_actor(
     let stream = connect_ipc(&ipc_path, &mut child).await?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
+    let mut next_request_id = 10_000_u64;
+    let mut pending_overlay_commands = HashMap::new();
 
     send_json(
         &mut writer,
@@ -249,10 +344,21 @@ async fn run_actor(
                     let _ = send_json(&mut writer, json!({"command": ["quit"]})).await;
                     break;
                 };
-                let should_quit = matches!(command, MpvCommand::Quit);
-                send_mpv_command(&mut writer, command).await?;
-                if should_quit {
-                    break;
+                match command {
+                    MpvCommand::AddOverlay { overlay, completed } => {
+                        let request_id = next_request_id;
+                        next_request_id = next_request_id.wrapping_add(1);
+                        send_json(&mut writer, overlay_command(overlay, request_id)).await?;
+                        pending_overlay_commands.insert(request_id, completed);
+                    }
+                    MpvCommand::RemoveOverlay(id) => {
+                        send_json(&mut writer, json!({"command": ["overlay-remove", id]})).await?;
+                    }
+                    MpvCommand::Quit => {
+                        send_mpv_command(&mut writer, MpvCommand::Quit).await?;
+                        break;
+                    }
+                    command => send_mpv_command(&mut writer, command).await?,
                 }
             }
             line = lines.next_line() => {
@@ -265,6 +371,9 @@ async fn run_actor(
                                 continue;
                             }
                         };
+                        if complete_overlay_command(&value, &mut pending_overlay_commands) {
+                            continue;
+                        }
                         if value.get("event").and_then(Value::as_str) == Some("file-loaded") {
                             set_window_state(&mut writer, &window_title, window_maximized).await?;
                             if start_seconds > 0.0 {
@@ -279,9 +388,14 @@ async fn run_actor(
                                     json!({"command": ["sub-add", subtitle_url.as_str(), "select"]}),
                                 ).await?;
                             }
+                            if let Some((width, height)) = thumbnail_size {
+                                configure_thumbnail_script(&mut writer, width, height).await?;
+                            }
                             let _ = events.send(MpvEvent::FileLoaded { id }).await;
                         } else if value.get("event").and_then(Value::as_str) == Some("property-change") {
                             emit_property(id, &value, &events).await;
+                        } else if value.get("event").and_then(Value::as_str) == Some("client-message") {
+                            emit_client_message(id, &value, &events).await;
                         } else if value.get("event").and_then(Value::as_str) == Some("end-file") {
                             let failed = value.get("reason").and_then(Value::as_str) == Some("error");
                             let _ = events.send(MpvEvent::Ended { id, failed }).await;
@@ -293,6 +407,10 @@ async fn run_actor(
                 }
             }
         }
+    }
+
+    for (_, completed) in pending_overlay_commands.drain() {
+        let _ = completed.send(Err("mpv 已退出".to_owned()));
     }
 
     match timeout(Duration::from_secs(3), child.wait()).await {
@@ -307,6 +425,68 @@ async fn run_actor(
         .send(MpvEvent::Terminated { id, failed: false })
         .await;
     Ok(())
+}
+
+fn overlay_command(overlay: Overlay, request_id: u64) -> Value {
+    let stride = overlay.width.saturating_mul(4);
+    json!({
+        "command": [
+            "overlay-add",
+            overlay.id,
+            overlay.x,
+            overlay.y,
+            overlay.path.to_string_lossy(),
+            0,
+            "bgra",
+            overlay.width,
+            overlay.height,
+            stride,
+            overlay.display_width,
+            overlay.display_height
+        ],
+        "request_id": request_id
+    })
+}
+
+fn complete_overlay_command(
+    value: &Value,
+    pending: &mut HashMap<u64, oneshot::Sender<std::result::Result<(), String>>>,
+) -> bool {
+    let Some(request_id) = value.get("request_id").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(completed) = pending.remove(&request_id) else {
+        return false;
+    };
+    let error = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("未知 mpv IPC 错误");
+    let result = if error == "success" {
+        Ok(())
+    } else {
+        Err(format!("mpv overlay-add 失败: {error}"))
+    };
+    let _ = completed.send(result);
+    true
+}
+
+async fn configure_thumbnail_script<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    send_json(
+        writer,
+        json!({"command": [
+            "script-message-to",
+            "thumbfast",
+            "jellyfin-mpv-thumbnail-info",
+            width.to_string(),
+            height.to_string()
+        ]}),
+    )
+    .await
 }
 
 async fn set_window_state<W: AsyncWrite + Unpin>(
@@ -349,6 +529,9 @@ async fn send_mpv_command<W: AsyncWrite + Unpin>(
             json!({"command": ["sub-add", url, "select"]})
         }
         MpvCommand::DisableSubtitle => json!({"command": ["set_property", "sid", "no"]}),
+        MpvCommand::AddOverlay { .. } | MpvCommand::RemoveOverlay(_) => {
+            unreachable!("覆盖层命令由 mpv actor 单独处理")
+        }
         MpvCommand::Quit => json!({"command": ["quit"]}),
     };
     send_json(writer, value).await
@@ -377,6 +560,77 @@ async fn emit_property(id: Uuid, value: &Value, events: &mpsc::Sender<MpvEvent>)
     };
     if let Some(event) = event {
         let _ = events.send(event).await;
+    }
+}
+
+async fn emit_client_message(id: Uuid, value: &Value, events: &mpsc::Sender<MpvEvent>) {
+    let Some(arguments) = value.get("args").and_then(Value::as_array) else {
+        return;
+    };
+    match arguments.first().and_then(Value::as_str) {
+        Some("jellyfin-mpv-preview") if arguments.len() >= 6 => {
+            let Some(seconds) = value_as_f64(&arguments[1]) else {
+                return;
+            };
+            let Some(x) = value_as_f64(&arguments[2]) else {
+                return;
+            };
+            let Some(y) = value_as_f64(&arguments[3]) else {
+                return;
+            };
+            let width = value_as_f64(&arguments[4]).unwrap_or(0.0).max(0.0) as u32;
+            let height = value_as_f64(&arguments[5]).unwrap_or(0.0).max(0.0) as u32;
+            let request = MpvPreviewRequest {
+                seconds,
+                x: x.round() as i64,
+                y: y.round() as i64,
+                width,
+                height,
+            };
+            let _ = events.try_send(MpvEvent::Preview {
+                id,
+                request: Some(request),
+            });
+        }
+        Some("jellyfin-mpv-preview-clear") => {
+            let _ = events.send(MpvEvent::Preview { id, request: None }).await;
+        }
+        _ => {}
+    }
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse::<f64>().ok())
+        .filter(|number| number.is_finite())
+}
+
+async fn prepare_thumbnail_script(id: Uuid) -> Result<PathBuf> {
+    let directory = std::env::temp_dir().join(format!("jellyfin-mpv-script-{id}"));
+    tokio::fs::create_dir(&directory)
+        .await
+        .with_context(|| format!("创建 mpv 脚本临时目录失败: {}", directory.display()))?;
+    if let Err(error) = tokio::fs::write(
+        directory.join("thumbfast.lua"),
+        include_bytes!("thumbfast.lua"),
+    )
+    .await
+    {
+        let _ = tokio::fs::remove_dir_all(&directory).await;
+        return Err(error).context("写入 mpv 缩略图桥接脚本失败");
+    }
+    Ok(directory)
+}
+
+async fn cleanup_thumbnail_script_directory(directory: Option<&Path>) {
+    let Some(directory) = directory else {
+        return;
+    };
+    if let Err(error) = tokio::fs::remove_dir_all(directory).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        debug!(%error, path = %directory.display(), "清理 mpv 缩略图桥接脚本失败");
     }
 }
 
@@ -555,6 +809,74 @@ mod tests {
         assert_eq!(
             messages[1]["command"],
             json!(["set_property", "pause", false])
+        );
+    }
+
+    #[tokio::test]
+    async fn parses_thumbnail_bridge_client_messages() {
+        let (events, mut receiver) = mpsc::channel(4);
+        let id = Uuid::new_v4();
+        emit_client_message(
+            id,
+            &json!({
+                "event": "client-message",
+                "args": ["jellyfin-mpv-preview", "12.5", "100.4", "200.6", "320", "180"]
+            }),
+            &events,
+        )
+        .await;
+
+        let MpvEvent::Preview {
+            request: Some(request),
+            ..
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("未生成缩略图请求");
+        };
+        assert_eq!(
+            request,
+            MpvPreviewRequest {
+                seconds: 12.5,
+                x: 100,
+                y: 201,
+                width: 320,
+                height: 180,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn completes_overlay_command_from_mpv_response() {
+        let (completed, result) = oneshot::channel();
+        let mut pending = HashMap::from([(42, completed)]);
+        assert!(complete_overlay_command(
+            &json!({"request_id": 42, "error": "success"}),
+            &mut pending,
+        ));
+        assert!(result.await.unwrap().is_ok());
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn configures_thumbnail_script_with_string_arguments() {
+        let (mut writer, mut reader) = duplex(1024);
+        configure_thumbnail_script(&mut writer, 320, 180)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let message: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(
+            message["command"],
+            json!([
+                "script-message-to",
+                "thumbfast",
+                "jellyfin-mpv-thumbnail-info",
+                "320",
+                "180"
+            ])
         );
     }
 }

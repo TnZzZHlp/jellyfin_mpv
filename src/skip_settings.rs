@@ -3,7 +3,7 @@ use std::{env, fs, path::PathBuf, sync::RwLock};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const ALL_SEGMENT_TYPES_QUERY: &str = "Intro,Outro,Recap,Preview,Commercial";
+pub const ALL_SEGMENT_TYPES: [&str; 5] = ["Intro", "Outro", "Recap", "Preview", "Commercial"];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn supports_every_native_jellyfin_segment_type() {
-        for segment_type in ALL_SEGMENT_TYPES_QUERY.split(',') {
+        for segment_type in ALL_SEGMENT_TYPES {
             assert!(SkipSettings::supports(segment_type));
         }
         assert!(!SkipSettings::supports("Unknown"));

@@ -11,6 +11,7 @@
 - 接收播放、暂停、继续、停止、跳转、设置音量、静音和取消静音；
 - 加载 Jellyfin 选中的外部或文本型内嵌字幕，并支持播放中远程切换/关闭字幕；
 - 读取 Jellyfin 原生 `MediaSegments`，按设置自动跳过片头、片尾、前情回顾、预告或广告；
+- 在 mpv 进度条悬停时显示 Jellyfin Trickplay 缩略图，兼容新版内置 OSC 和 uosc/thumbfast 协议；
 - 分析当前 ASS/SSA 字幕声明的字体，并只下载媒体中名称匹配的 TTF/OTF/TTC/OTC/WOFF/WOFF2 字体附件；
 - 请求 `/Items/{itemId}/PlaybackInfo`，优先让 mpv 直接播放，必要时使用 Jellyfin 返回的转码流；
 - 为每次播放启动独立的外部 mpv，通过 JSON IPC 控制；
@@ -125,6 +126,14 @@ cargo run --release -- --mpv-arg=--no-config --mpv-arg=--fullscreen
 播放进入已勾选的有效分段后会自动跳到其结束时间并立即上报新进度；同一分段每次播放只自动跳过一次，因此手动回看不会反复触发。续播点或手动跳转已经越过的分段也不会在回看时自动跳过。
 
 分段数据需要先由 Jellyfin 媒体分段提供器生成；没有分段数据时保持普通播放。Jellyfin 10.9 及更早版本返回 404 时会自动兼容，不影响播放。
+
+## 进度条缩略图
+
+程序读取媒体项目的 Jellyfin Trickplay 清单，并在鼠标悬停于 mpv 进度条时按需下载对应雪碧图。雪碧图使用当前登录会话鉴权，Access Token 不会写入图片 URL、mpv 参数或临时文件。
+
+Jellyfin 服务器需要先在媒体库设置中启用并生成 Trickplay 图片。mpv 可使用支持 OSC Preview API 的新版内置 OSC，也可以使用 uosc 等兼容 thumbfast 消息协议的界面；程序会为每次播放自动加载桥接脚本，无需另行安装 `thumbfast.lua`。
+
+客户端只缓存当前使用的一张雪碧图，并把正在显示的单帧临时转换为 BGRA 覆盖层；播放结束后会删除桥接脚本和像素临时目录。没有 Trickplay 数据、图片下载失败或 mpv 界面不支持预览请求时保持普通播放，不影响播放控制。
 
 ## 修改服务器设置
 
