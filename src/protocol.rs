@@ -212,19 +212,7 @@ pub struct MediaSource {
     #[serde(default)]
     pub media_streams: Vec<MediaStream>,
     #[serde(default)]
-    pub media_attachments: Vec<MediaAttachment>,
-    #[serde(default)]
     pub required_http_headers: HashMap<String, Option<String>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct MediaAttachment {
-    pub index: i32,
-    pub codec: Option<String>,
-    pub file_name: Option<String>,
-    pub mime_type: Option<String>,
-    pub delivery_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

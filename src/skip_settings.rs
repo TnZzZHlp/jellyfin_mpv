@@ -5,9 +5,26 @@ use serde::{Deserialize, Serialize};
 
 pub const ALL_SEGMENT_TYPES: [&str; 5] = ["Intro", "Outro", "Recap", "Preview", "Commercial"];
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackMode {
+    Windowed,
+    Maximized,
+    Fullscreen,
+}
+
+impl Default for PlaybackMode {
+    fn default() -> Self {
+        Self::Maximized
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct SkipSettings {
+    #[serde(alias = "always_on_top")]
+    pub bring_to_front_on_start: bool,
+    pub playback_mode: PlaybackMode,
     pub intro: bool,
     pub outro: bool,
     pub recap: bool,
@@ -18,6 +35,8 @@ pub struct SkipSettings {
 impl Default for SkipSettings {
     fn default() -> Self {
         Self {
+            bring_to_front_on_start: false,
+            playback_mode: PlaybackMode::Maximized,
             intro: true,
             outro: true,
             recap: false,
@@ -73,9 +92,9 @@ impl SkipSettingsStore {
             fs::create_dir_all(parent)
                 .with_context(|| format!("创建设置目录 {} 失败", parent.display()))?;
         }
-        let bytes = serde_json::to_vec_pretty(&settings).context("序列化跳过设置失败")?;
+        let bytes = serde_json::to_vec_pretty(&settings).context("序列化本地设置失败")?;
         fs::write(&self.path, bytes)
-            .with_context(|| format!("写入跳过设置 {} 失败", self.path.display()))?;
+            .with_context(|| format!("写入本地设置 {} 失败", self.path.display()))?;
         *self
             .current
             .write()
@@ -86,10 +105,10 @@ impl SkipSettingsStore {
     fn load_from(path: PathBuf) -> Result<Self> {
         let current = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("解析跳过设置 {} 失败", path.display()))?,
+                .with_context(|| format!("解析本地设置 {} 失败", path.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => SkipSettings::default(),
             Err(error) => {
-                return Err(error).with_context(|| format!("读取跳过设置 {} 失败", path.display()));
+                return Err(error).with_context(|| format!("读取本地设置 {} 失败", path.display()));
             }
         };
         Ok(Self::new(path, current))
@@ -122,8 +141,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_skipping_intro_and_outro_only() {
+    fn defaults_to_maximized_non_fronted_playback_and_skips_intro_and_outro_only() {
         let settings = SkipSettings::default();
+        assert!(!settings.bring_to_front_on_start);
+        assert_eq!(settings.playback_mode, PlaybackMode::Maximized);
         assert!(settings.is_enabled("Intro"));
         assert!(settings.is_enabled("Outro"));
         assert!(!settings.is_enabled("Recap"));
@@ -138,6 +159,8 @@ mod tests {
         let path = directory.join("settings.json");
         let store = SkipSettingsStore::for_test(path.clone(), SkipSettings::default());
         let expected = SkipSettings {
+            bring_to_front_on_start: true,
+            playback_mode: PlaybackMode::Fullscreen,
             intro: false,
             outro: true,
             recap: true,
@@ -150,6 +173,24 @@ mod tests {
         assert_eq!(loaded.snapshot(), expected);
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn uses_playback_defaults_when_loading_existing_skip_settings() {
+        let settings: SkipSettings =
+            serde_json::from_str(r#"{"intro": false, "outro": false}"#).unwrap();
+
+        assert!(!settings.bring_to_front_on_start);
+        assert_eq!(settings.playback_mode, PlaybackMode::Maximized);
+        assert!(!settings.intro);
+        assert!(!settings.outro);
+    }
+
+    #[test]
+    fn migrates_the_early_always_on_top_setting_to_one_time_window_fronting() {
+        let settings: SkipSettings = serde_json::from_str(r#"{"always_on_top": true}"#).unwrap();
+
+        assert!(settings.bring_to_front_on_start);
     }
 
     #[test]

@@ -12,11 +12,10 @@
 - 加载 Jellyfin 选中的外部或文本型内嵌字幕，并支持播放中远程切换/关闭字幕；
 - 读取 Jellyfin 原生 `MediaSegments`，按设置自动跳过片头、片尾、前情回顾、预告或广告；
 - 在 mpv 进度条悬停时显示 Jellyfin Trickplay 缩略图，兼容新版内置 OSC 和 uosc/thumbfast 协议；
-- 分析当前 ASS/SSA 字幕声明的字体，并只下载媒体中名称匹配的 TTF/OTF/TTC/OTC/WOFF/WOFF2 字体附件；
 - 请求 `/Items/{itemId}/PlaybackInfo`，优先让 mpv 直接播放，必要时使用 Jellyfin 返回的转码流；
 - 为每次播放启动独立的外部 mpv，通过 JSON IPC 控制；
 - mpv 窗口标题显示当前 Jellyfin 媒体名称；
-- mpv 窗口默认最大化启动；
+- mpv 播放窗口可按设置以窗口化、最大化或全屏模式启动，并可在开始播放时前置一次窗口；
 - Windows 默认不显示控制台，只在通知区域显示托盘图标；托盘菜单可打开实时日志终端或安全退出；
 - Windows 下只允许一个接收端实例运行，重复启动会显示提示，避免相同设备的登录 Token 互相失效；
 - 每 5 秒上报播放进度；播放结束、mpv 退出、切换媒体或程序退出时上报停止。
@@ -72,7 +71,7 @@ cargo run --release
 
 Windows 上连接成功后会显示托盘图标。单击或右键图标可打开菜单：
 
-- “设置...”可修改 Jellyfin 服务器地址、用户名、密码和自动跳过的分段类型；
+- “设置...”可修改 Jellyfin 服务器地址、用户名、密码、自动跳过的分段类型及播放窗口选项；
 - “打开日志终端”会启动独立的 PowerShell 窗口，显示最近 200 行并实时跟踪新日志；
 - “退出”会停止当前 mpv、向 Jellyfin 上报停止并关闭后台任务。
 
@@ -115,7 +114,7 @@ cargo run --release
 cargo run --release -- --mpv-arg=--no-config --mpv-arg=--fullscreen
 ```
 
-如需关闭默认最大化，可传入 `--mpv-arg=--window-maximized=no`。
+默认播放模式为最大化，开始播放时默认不前置窗口。可在托盘菜单的“设置...”中改为窗口化、最大化或全屏，并选择是否在开始播放时将窗口置于前台；保存后会在下次播放生效。`--mpv-arg` 中的 `--window-maximized` 或 `--fullscreen` 仍可覆盖窗口模式设置。
 
 设置 `RUST_LOG=jellyfin_mpv=debug` 可输出调试日志。通过登录窗口登录成功后，登录信息保存在 Windows 凭据管理器的 `jellyfin_mpv/login` 项中，不会写入明文配置文件或日志；完全通过命令行或环境变量登录不会改写该凭据。为了支持 Token 失效后自动登录，程序运行期间会在内存中保留解码后的密码。登录后取得的 Access Token 不会写入日志，也不会放入 mpv 命令行或媒体 URL；程序通过 mpv IPC 设置 HTTP 请求头，并在 Token 更新后同步更新 mpv。
 
@@ -127,6 +126,10 @@ cargo run --release -- --mpv-arg=--no-config --mpv-arg=--fullscreen
 
 分段数据需要先由 Jellyfin 媒体分段提供器生成；没有分段数据时保持普通播放。Jellyfin 10.9 及更早版本返回 404 时会自动兼容，不影响播放。
 
+## 播放窗口
+
+托盘菜单的“设置...”页面提供“默认播放模式”（窗口化、最大化、全屏）以及“开始播放时将窗口置于前台”选项。前置操作只会在 mpv 成功加载该次媒体后执行一次，不会让窗口持续保持最前。选项与跳过分段设置一起保存到 `%LOCALAPPDATA%\jellyfin_mpv\settings.json`。
+
 ## 进度条缩略图
 
 程序读取媒体项目的 Jellyfin Trickplay 清单，播放开始后以最多两个并发请求在后台预取全部压缩雪碧图。鼠标先悬停到尚未预取的区域时会直接复用或发起该图片的下载，不必等待整个预取队列。雪碧图使用当前登录会话鉴权，Access Token 不会写入图片 URL、mpv 参数或临时文件。
@@ -137,7 +140,7 @@ Jellyfin 服务器需要先在媒体库设置中启用并生成 Trickplay 图片
 
 ## 修改服务器设置
 
-打开托盘菜单中的“设置...”，可修改服务器地址、用户名和密码。登录信息仍保存到 Windows 凭据管理器的 `jellyfin_mpv/login` 项，不会写入 `settings.json`。服务器或登录信息发生变化时，程序会停止当前播放、关闭旧 WebSocket 并连接新服务器；如果连接失败，会保留托盘和设置入口以便再次修改。
+打开托盘菜单中的“设置...”，可修改服务器地址、用户名、密码和播放窗口选项。登录信息仍保存到 Windows 凭据管理器的 `jellyfin_mpv/login` 项，不会写入 `settings.json`。服务器或登录信息发生变化时，程序会停止当前播放、关闭旧 WebSocket 并连接新服务器；如果连接失败，会保留托盘和设置入口以便再次修改。
 
 ## 状态流
 
@@ -150,7 +153,5 @@ Jellyfin WebSocket 命令
           ▼
    外部 mpv JSON IPC ─── 播放结束 ────▶ Jellyfin HTTP 停止上报
 ```
-
-程序只处理当前媒体自带的字体附件，不请求 Jellyfin 服务器备用字体。选择 ASS/SSA 字幕后，程序会读取字幕的样式定义和行内 `\fn` 标签，再通过 `/Videos/{videoId}/{mediaSourceId}/Attachments/{index}` 下载名称匹配的字体。字体临时写入系统临时目录，通过 mpv `--sub-fonts-dir` 加载，并在播放结束后删除。单个字体限制为 32 MiB，每次播放最多写入 128 MiB；未被字幕引用的字体及封面等非字体附件会被忽略。
 
 第一版有意不处理播放队列、上一首/下一首、远程选音轨、多服务器、发现服务器和本地媒体库界面。PGS 等图片型内嵌字幕仍由原始媒体或 Jellyfin 转码流处理，不单独提取加载。

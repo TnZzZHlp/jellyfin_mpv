@@ -18,7 +18,6 @@ use crate::{
     thumbnail::{ThumbnailWorker, select_trickplay},
 };
 
-const FONT_PREPARATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MEDIA_SEGMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Player {
@@ -42,7 +41,6 @@ struct Playback {
     audio_stream_index: Option<i32>,
     subtitle_stream_index: Option<i32>,
     media_streams: Vec<MediaStream>,
-    font_directory: Option<PathBuf>,
     thumbnail: Option<ThumbnailWorker>,
     required_http_headers: HashMap<String, Option<String>>,
     auth_generation: u64,
@@ -316,56 +314,24 @@ impl Player {
             .flatten();
         let media_streams = source.media_streams.clone();
         let trickplay = select_trickplay(&item, &source_id);
-        let needs_fonts =
-            selected_subtitle_needs_fonts(&source.media_streams, subtitle_stream_index);
-        let font_directory = if needs_fonts {
-            if let Some(subtitle_url) = subtitle_url.as_ref() {
-                match timeout(
-                    FONT_PREPARATION_TIMEOUT,
-                    self.client.download_fonts(
-                        &item.id,
-                        &source_id,
-                        &source.media_attachments,
-                        subtitle_url,
-                    ),
-                )
-                .await
-                {
-                    Ok(directory) => directory,
-                    Err(_) => {
-                        warn!(
-                            timeout_seconds = FONT_PREPARATION_TIMEOUT.as_secs(),
-                            "准备字幕字体超时，跳过字体并继续播放"
-                        );
-                        None
-                    }
-                }
-            } else {
-                warn!("所选 ASS/SSA 字幕没有可下载地址，跳过字体下载");
-                None
-            }
-        } else {
-            None
-        };
+        let playback_settings = self.skip_settings.snapshot();
         let mpv = match spawn_mpv(MpvLaunch {
             executable: self.mpv_path.clone(),
             extra_args: self.mpv_args.clone(),
             window_title: item.name.clone(),
+            bring_to_front_on_start: playback_settings.bring_to_front_on_start,
+            playback_mode: playback_settings.playback_mode,
             url,
             headers,
             start_seconds: start_ticks as f64 / 10_000_000.0,
             subtitle_url,
-            font_directory: font_directory.clone(),
             thumbnail_size: trickplay.as_ref().map(|profile| profile.display_size()),
             events: self.mpv_events.clone(),
         })
         .await
         {
             Ok(mpv) => mpv,
-            Err(error) => {
-                cleanup_font_directory(font_directory.as_ref()).await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
 
         let thumbnail = if let Some(profile) = trickplay {
@@ -392,7 +358,6 @@ impl Player {
             audio_stream_index,
             subtitle_stream_index,
             media_streams,
-            font_directory,
             thumbnail,
             required_http_headers: source.required_http_headers.clone(),
             auth_generation,
@@ -578,7 +543,6 @@ impl Player {
             thumbnail.stop().await;
         }
         let _ = playback.mpv.quit().await;
-        cleanup_font_directory(playback.font_directory.as_ref()).await;
         if playback.started {
             if let Err(error) = self.client.report_stop(&playback.stop_report(failed)).await {
                 warn!(%error, "上报 Jellyfin 停止播放失败");
@@ -600,25 +564,6 @@ impl Player {
     }
 }
 
-async fn cleanup_font_directory(directory: Option<&PathBuf>) {
-    let Some(directory) = directory else {
-        return;
-    };
-    for attempt in 0..10 {
-        match tokio::fs::remove_dir_all(directory).await {
-            Ok(()) => return,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 9 => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(error) => {
-                warn!(%error, path = %directory.display(), "清理字幕字体临时目录失败");
-                return;
-            }
-        }
-    }
-}
-
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -634,17 +579,6 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
-}
-
-fn selected_subtitle_needs_fonts(streams: &[MediaStream], selected_index: Option<i32>) -> bool {
-    selected_index
-        .and_then(|index| {
-            streams
-                .iter()
-                .find(|stream| stream.stream_type == "Subtitle" && stream.index == index)
-        })
-        .and_then(|stream| stream.codec.as_deref())
-        .is_some_and(|codec| codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa"))
 }
 
 fn prepare_skip_segments(segments: Vec<MediaSegment>, initial_ticks: i64) -> Vec<SkipSegment> {
@@ -756,29 +690,6 @@ mod tests {
             next_skip_target(&mut segments, 150, &settings),
             Some(("Recap".to_owned(), 200))
         );
-    }
-
-    #[test]
-    fn prepares_fonts_only_for_the_selected_ass_or_ssa_subtitle() {
-        let streams = vec![subtitle(2, "ass"), subtitle(3, "srt")];
-
-        assert!(!selected_subtitle_needs_fonts(&streams, None));
-        assert!(selected_subtitle_needs_fonts(&streams, Some(2)));
-        assert!(!selected_subtitle_needs_fonts(&streams, Some(3)));
-        assert!(!selected_subtitle_needs_fonts(&streams, Some(99)));
-    }
-
-    fn subtitle(index: i32, codec: &str) -> MediaStream {
-        MediaStream {
-            index,
-            stream_type: "Subtitle".to_owned(),
-            codec: Some(codec.to_owned()),
-            language: None,
-            display_title: None,
-            is_text_subtitle_stream: true,
-            delivery_method: None,
-            delivery_url: None,
-        }
     }
 
     fn media_segment(kind: &str, start_ticks: i64, end_ticks: i64) -> MediaSegment {

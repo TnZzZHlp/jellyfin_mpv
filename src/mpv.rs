@@ -18,9 +18,143 @@ use tracing::{debug, warn};
 use url::Url;
 use uuid::Uuid;
 
+use crate::skip_settings::PlaybackMode;
+
 trait AsyncIpc: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncIpc for T {}
 type IpcStream = Box<dyn AsyncIpc>;
+
+#[cfg(windows)]
+fn bring_mpv_window_to_front(process_id: Option<u32>) {
+    const WINDOW_DISCOVERY_RETRIES: usize = 10;
+    const WINDOW_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+    let Some(process_id) = process_id else {
+        return;
+    };
+
+    // `file-loaded` can arrive just before mpv maps its native window. Run the
+    // short discovery retry outside the IPC actor so playback events continue
+    // to be processed while the window becomes visible.
+    std::mem::drop(tokio::task::spawn_blocking(move || {
+        for attempt in 0..WINDOW_DISCOVERY_RETRIES {
+            match window_activation::bring_to_front(process_id) {
+                window_activation::ActivationResult::Activated => return,
+                window_activation::ActivationResult::WindowNotFound
+                    if attempt + 1 < WINDOW_DISCOVERY_RETRIES =>
+                {
+                    std::thread::sleep(WINDOW_DISCOVERY_RETRY_INTERVAL);
+                }
+                window_activation::ActivationResult::WindowNotFound => {
+                    debug!(%process_id, "mpv 播放窗口未及时创建，无法置于前台");
+                    return;
+                }
+                window_activation::ActivationResult::Rejected => {
+                    debug!(%process_id, "Windows 拒绝将 mpv 播放窗口置于前台");
+                    return;
+                }
+            }
+        }
+    }));
+}
+
+#[cfg(not(windows))]
+fn bring_mpv_window_to_front(_process_id: Option<u32>) {}
+
+#[cfg(windows)]
+mod window_activation {
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM},
+        System::Threading::{AttachThreadInput, GetCurrentThreadId},
+        UI::WindowsAndMessaging::{
+            BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,
+            IsWindowVisible, MSG, PM_NOREMOVE, PeekMessageW, SW_RESTORE, SetForegroundWindow,
+            ShowWindowAsync,
+        },
+    };
+
+    #[derive(Debug)]
+    pub(super) enum ActivationResult {
+        Activated,
+        WindowNotFound,
+        Rejected,
+    }
+
+    struct WindowSearch {
+        process_id: u32,
+        hwnd: HWND,
+    }
+
+    pub(super) fn bring_to_front(process_id: u32) -> ActivationResult {
+        let mut search = WindowSearch {
+            process_id,
+            hwnd: std::ptr::null_mut(),
+        };
+        unsafe {
+            EnumWindows(
+                Some(find_window_for_process),
+                (&mut search as *mut WindowSearch) as LPARAM,
+            );
+        }
+
+        if search.hwnd.is_null() {
+            return ActivationResult::WindowNotFound;
+        }
+
+        if unsafe { GetForegroundWindow() } == search.hwnd {
+            return ActivationResult::Activated;
+        }
+
+        unsafe {
+            if IsIconic(search.hwnd) != 0 {
+                ShowWindowAsync(search.hwnd, SW_RESTORE);
+            }
+
+            // A WebSocket command is handled by a background process, which
+            // normally has no permission to call SetForegroundWindow. Attach
+            // only for this activation attempt to the foreground input queue;
+            // this gives the request the same focus context without making mpv
+            // permanently topmost.
+            let foreground = GetForegroundWindow();
+            let foreground_thread = if foreground.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+            };
+            let current_thread = GetCurrentThreadId();
+            let mut message = MSG::default();
+            PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+            let input_attached = foreground_thread != 0
+                && foreground_thread != current_thread
+                && AttachThreadInput(current_thread, foreground_thread, 1) != 0;
+
+            BringWindowToTop(search.hwnd);
+            let activated =
+                SetForegroundWindow(search.hwnd) != 0 || GetForegroundWindow() == search.hwnd;
+
+            if input_attached {
+                AttachThreadInput(current_thread, foreground_thread, 0);
+            }
+
+            if activated || GetForegroundWindow() == search.hwnd {
+                ActivationResult::Activated
+            } else {
+                ActivationResult::Rejected
+            }
+        }
+    }
+
+    unsafe extern "system" fn find_window_for_process(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let search = unsafe { &mut *(lparam as *mut WindowSearch) };
+        let mut process_id = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+        if process_id != search.process_id || unsafe { IsWindowVisible(hwnd) } == 0 {
+            return 1;
+        }
+        search.hwnd = hwnd;
+        0
+    }
+}
 
 #[derive(Debug)]
 pub enum MpvEvent {
@@ -164,11 +298,12 @@ pub struct MpvLaunch {
     pub executable: PathBuf,
     pub extra_args: Vec<OsString>,
     pub window_title: String,
+    pub bring_to_front_on_start: bool,
+    pub playback_mode: PlaybackMode,
     pub url: Url,
     pub headers: Vec<String>,
     pub start_seconds: f64,
     pub subtitle_url: Option<Url>,
-    pub font_directory: Option<PathBuf>,
     pub thumbnail_size: Option<(u32, u32)>,
     pub events: mpsc::Sender<MpvEvent>,
 }
@@ -178,17 +313,18 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
         executable,
         extra_args,
         window_title,
+        bring_to_front_on_start,
+        playback_mode,
         url,
         headers,
         start_seconds,
         subtitle_url,
-        font_directory,
         mut thumbnail_size,
         events,
     } = launch;
     let id = Uuid::new_v4();
     let ipc_path = ipc_path(id);
-    let window_maximized = window_maximized(&extra_args);
+    let window_state = effective_window_state(playback_mode, &extra_args);
     let thumbnail_script_directory = if thumbnail_size.is_some() {
         match prepare_thumbnail_script(id).await {
             Ok(directory) => Some(directory),
@@ -202,10 +338,7 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
         None
     };
     let mut command = Command::new(&executable);
-    command.args(window_args(&extra_args));
-    if let Some(directory) = font_directory {
-        command.arg(format!("--sub-fonts-dir={}", directory.to_string_lossy()));
-    }
+    command.args(window_args(window_state, &extra_args));
     if let Some(directory) = thumbnail_script_directory.as_ref() {
         command.arg(format!(
             "--script={}",
@@ -242,7 +375,8 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
             url,
             headers,
             window_title,
-            window_maximized,
+            window_state,
+            bring_to_front_on_start,
             start_seconds,
             subtitle_url,
             thumbnail_size,
@@ -275,22 +409,64 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
     }
 }
 
-fn window_args(extra_args: &[OsString]) -> Vec<OsString> {
-    let mut args = vec![OsString::from("--window-maximized=yes")];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowState {
+    maximized: bool,
+    fullscreen: bool,
+}
+
+impl WindowState {
+    fn from_playback_settings(playback_mode: PlaybackMode) -> Self {
+        match playback_mode {
+            PlaybackMode::Windowed => Self {
+                maximized: false,
+                fullscreen: false,
+            },
+            PlaybackMode::Maximized => Self {
+                maximized: true,
+                fullscreen: false,
+            },
+            PlaybackMode::Fullscreen => Self {
+                maximized: false,
+                fullscreen: true,
+            },
+        }
+    }
+}
+
+fn effective_window_state(playback_mode: PlaybackMode, extra_args: &[OsString]) -> WindowState {
+    let mut state = WindowState::from_playback_settings(playback_mode);
+    for argument in extra_args {
+        match argument.to_string_lossy().as_ref() {
+            "--window-maximized" | "--window-maximized=yes" | "--window-maximized=true" => {
+                state.maximized = true;
+            }
+            "--window-maximized=no" | "--window-maximized=false" | "--no-window-maximized" => {
+                state.maximized = false;
+            }
+            "--fullscreen" | "--fullscreen=yes" | "--fullscreen=true" => {
+                state.fullscreen = true;
+            }
+            "--fullscreen=no" | "--fullscreen=false" | "--no-fullscreen" => {
+                state.fullscreen = false;
+            }
+            _ => {}
+        }
+    }
+    state
+}
+
+fn window_args(window_state: WindowState, extra_args: &[OsString]) -> Vec<OsString> {
+    let mut args = vec![
+        mpv_boolean_option("--window-maximized", window_state.maximized),
+        mpv_boolean_option("--fullscreen", window_state.fullscreen),
+    ];
     args.extend_from_slice(extra_args);
     args
 }
 
-fn window_maximized(extra_args: &[OsString]) -> bool {
-    let mut maximized = true;
-    for argument in extra_args {
-        match argument.to_string_lossy().as_ref() {
-            "--window-maximized=yes" => maximized = true,
-            "--window-maximized=no" | "--no-window-maximized" => maximized = false,
-            _ => {}
-        }
-    }
-    maximized
+fn mpv_boolean_option(name: &str, value: bool) -> OsString {
+    OsString::from(format!("{name}={}", if value { "yes" } else { "no" }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -301,7 +477,8 @@ async fn run_actor(
     url: Url,
     headers: Vec<String>,
     window_title: String,
-    window_maximized: bool,
+    window_state: WindowState,
+    bring_to_front_on_start: bool,
     start_seconds: f64,
     subtitle_url: Option<Url>,
     thumbnail_size: Option<(u32, u32)>,
@@ -314,13 +491,14 @@ async fn run_actor(
     let mut lines = BufReader::new(reader).lines();
     let mut next_request_id = 10_000_u64;
     let mut pending_overlay_commands = HashMap::new();
+    let mut needs_initial_activation = bring_to_front_on_start;
 
     send_json(
         &mut writer,
         json!({"command": ["set_property", "http-header-fields", headers]}),
     )
     .await?;
-    set_window_state(&mut writer, &window_title, window_maximized).await?;
+    set_window_state(&mut writer, &window_title, window_state).await?;
     for (number, property) in ["time-pos", "pause", "mute", "volume"].iter().enumerate() {
         send_json(
             &mut writer,
@@ -375,7 +553,11 @@ async fn run_actor(
                             continue;
                         }
                         if value.get("event").and_then(Value::as_str) == Some("file-loaded") {
-                            set_window_state(&mut writer, &window_title, window_maximized).await?;
+                            set_window_state(&mut writer, &window_title, window_state).await?;
+                            if needs_initial_activation {
+                                bring_mpv_window_to_front(child.id());
+                                needs_initial_activation = false;
+                            }
                             if start_seconds > 0.0 {
                                 send_json(
                                     &mut writer,
@@ -492,7 +674,7 @@ async fn configure_thumbnail_script<W: AsyncWrite + Unpin>(
 async fn set_window_state<W: AsyncWrite + Unpin>(
     writer: &mut W,
     title: &str,
-    maximized: bool,
+    window_state: WindowState,
 ) -> Result<()> {
     send_json(
         writer,
@@ -502,7 +684,12 @@ async fn set_window_state<W: AsyncWrite + Unpin>(
     send_json(writer, json!({"command": ["set_property", "title", title]})).await?;
     send_json(
         writer,
-        json!({"command": ["set_property", "window-maximized", maximized]}),
+        json!({"command": ["set_property", "window-maximized", window_state.maximized]}),
+    )
+    .await?;
+    send_json(
+        writer,
+        json!({"command": ["set_property", "fullscreen", window_state.fullscreen]}),
     )
     .await
 }
@@ -696,21 +883,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maximizes_by_default_and_allows_an_explicit_override() {
-        let args = window_args(&[OsString::from("--window-maximized=no")]);
+    fn applies_playback_preferences_and_allows_mpv_argument_overrides() {
+        assert_eq!(
+            WindowState::from_playback_settings(PlaybackMode::Windowed),
+            WindowState {
+                maximized: false,
+                fullscreen: false,
+            }
+        );
+        assert_eq!(
+            WindowState::from_playback_settings(PlaybackMode::Maximized),
+            WindowState {
+                maximized: true,
+                fullscreen: false,
+            }
+        );
+        assert_eq!(
+            WindowState::from_playback_settings(PlaybackMode::Fullscreen),
+            WindowState {
+                maximized: false,
+                fullscreen: true,
+            }
+        );
 
+        let extra_args = [
+            OsString::from("--no-fullscreen"),
+            OsString::from("--window-maximized=yes"),
+        ];
+        let state = effective_window_state(PlaybackMode::Fullscreen, &extra_args);
+        assert_eq!(
+            state,
+            WindowState {
+                maximized: true,
+                fullscreen: false,
+            }
+        );
+
+        let args = window_args(state, &extra_args);
         assert_eq!(args[0], "--window-maximized=yes");
-        assert_eq!(args[1], "--window-maximized=no");
-        assert!(!window_maximized(&args));
-        assert!(window_maximized(&[]));
+        assert_eq!(args[1], "--fullscreen=no");
+        assert_eq!(args[2], "--no-fullscreen");
     }
 
     #[tokio::test]
     async fn sets_media_and_window_titles_through_ipc() {
         let (mut writer, mut reader) = duplex(1024);
-        set_window_state(&mut writer, "剧集名称 S01E02", true)
-            .await
-            .unwrap();
+        set_window_state(
+            &mut writer,
+            "剧集名称 S01E02",
+            WindowState {
+                maximized: false,
+                fullscreen: true,
+            },
+        )
+        .await
+        .unwrap();
         drop(writer);
 
         let mut output = String::new();
@@ -729,7 +956,11 @@ mod tests {
         );
         assert_eq!(
             messages[2]["command"],
-            json!(["set_property", "window-maximized", true])
+            json!(["set_property", "window-maximized", false])
+        );
+        assert_eq!(
+            messages[3]["command"],
+            json!(["set_property", "fullscreen", true])
         );
     }
 

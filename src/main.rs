@@ -87,7 +87,7 @@ async fn run() -> Result<()> {
     let skip_settings = Arc::new(match SkipSettingsStore::load() {
         Ok(settings) => settings,
         Err(error) => {
-            warn!(%error, "读取跳过设置失败，使用默认设置");
+            warn!(%error, "读取本地设置失败，使用默认设置");
             SkipSettingsStore::default_store()
         }
     });

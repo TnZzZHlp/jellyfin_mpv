@@ -27,11 +27,12 @@ mod platform {
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
             BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON,
-            CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-            ES_AUTOHSCROLL, ES_PASSWORD, GWLP_USERDATA, GetMessageW, GetSystemMetrics,
-            GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IsDialogMessageW,
-            IsWindow, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW,
-            RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SendMessageW, SetForegroundWindow,
+            CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CREATESTRUCTW,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL,
+            ES_PASSWORD, GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
+            GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IsDialogMessageW, IsWindow,
+            LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW, RegisterClassW,
+            SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SendMessageW, SetForegroundWindow,
             SetWindowLongPtrW, ShowWindow, TranslateMessage, WM_CLOSE, WM_COMMAND, WM_NCCREATE,
             WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU,
             WS_TABSTOP, WS_VISIBLE,
@@ -42,7 +43,7 @@ mod platform {
     use crate::{
         credential_store::{SavedLogin, save_login},
         login_ui::validate_input,
-        skip_settings::SkipSettings,
+        skip_settings::{PlaybackMode, SkipSettings},
     };
 
     const WINDOW_CLASS: &str = "JellyfinMpvSettingsWindow";
@@ -54,6 +55,8 @@ mod platform {
     const ID_RECAP: usize = 1203;
     const ID_PREVIEW: usize = 1204;
     const ID_COMMERCIAL: usize = 1205;
+    const ID_BRING_TO_FRONT_ON_START: usize = 1301;
+    const ID_PLAYBACK_MODE: usize = 1302;
     const ID_SAVE: usize = 1;
     const ID_CANCEL: usize = 2;
     const BST_UNCHECKED: u32 = 0;
@@ -69,6 +72,8 @@ mod platform {
         recap: HWND,
         preview: HWND,
         commercial: HWND,
+        bring_to_front_on_start: HWND,
+        playback_mode: HWND,
     }
 
     impl SettingsState {
@@ -83,6 +88,8 @@ mod platform {
                 recap: null_mut(),
                 preview: null_mut(),
                 commercial: null_mut(),
+                bring_to_front_on_start: null_mut(),
+                playback_mode: null_mut(),
             }
         }
     }
@@ -109,7 +116,7 @@ mod platform {
             let state_ptr = Box::into_raw(state);
             let title = wide("Jellyfin MPV 设置");
             let width = 520;
-            let height = 430;
+            let height = 540;
             let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
             let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
             let hwnd = CreateWindowExW(
@@ -178,7 +185,7 @@ mod platform {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let skips = state.context.skip_settings.snapshot();
+        let settings = state.context.skip_settings.snapshot();
 
         unsafe { create_label(hwnd, instance, "服务器地址", 24, 24, 88, 22, font) }?;
         state.server = unsafe {
@@ -243,7 +250,7 @@ mod platform {
                 "片头 (Intro)",
                 34,
                 192,
-                skips.intro,
+                settings.intro,
                 font,
             )
         }?;
@@ -255,7 +262,7 @@ mod platform {
                 "片尾 (Outro)",
                 264,
                 192,
-                skips.outro,
+                settings.outro,
                 font,
             )
         }?;
@@ -267,7 +274,7 @@ mod platform {
                 "前情回顾 (Recap)",
                 34,
                 228,
-                skips.recap,
+                settings.recap,
                 font,
             )
         }?;
@@ -279,7 +286,7 @@ mod platform {
                 "预告 (Preview)",
                 264,
                 228,
-                skips.preview,
+                settings.preview,
                 font,
             )
         }?;
@@ -291,7 +298,34 @@ mod platform {
                 "广告 (Commercial)",
                 34,
                 264,
-                skips.commercial,
+                settings.commercial,
+                font,
+            )
+        }?;
+
+        unsafe { create_label(hwnd, instance, "播放窗口：", 24, 310, 350, 24, font) }?;
+        state.bring_to_front_on_start = unsafe {
+            create_checkbox(
+                hwnd,
+                instance,
+                ID_BRING_TO_FRONT_ON_START,
+                "开始播放时将窗口置于前台",
+                34,
+                342,
+                settings.bring_to_front_on_start,
+                font,
+            )
+        }?;
+        unsafe { create_label(hwnd, instance, "默认播放模式", 24, 382, 88, 22, font) }?;
+        state.playback_mode = unsafe {
+            create_playback_mode_selector(
+                hwnd,
+                instance,
+                ID_PLAYBACK_MODE,
+                settings.playback_mode,
+                118,
+                378,
+                220,
                 font,
             )
         }?;
@@ -302,7 +336,7 @@ mod platform {
                 instance,
                 "服务器或登录信息发生变化时，当前播放会停止并重新连接。",
                 24,
-                310,
+                422,
                 464,
                 22,
                 font,
@@ -315,7 +349,7 @@ mod platform {
                 ID_SAVE,
                 "保存",
                 304,
-                346,
+                458,
                 BS_DEFPUSHBUTTON as u32,
                 font,
             )
@@ -327,7 +361,7 @@ mod platform {
                 ID_CANCEL,
                 "取消",
                 408,
-                346,
+                458,
                 BS_PUSHBUTTON as u32,
                 font,
             )
@@ -421,6 +455,52 @@ mod platform {
             );
         }
         Ok(checkbox)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn create_playback_mode_selector(
+        parent: HWND,
+        instance: HINSTANCE,
+        id: usize,
+        selected: PlaybackMode,
+        x: i32,
+        y: i32,
+        width: i32,
+        font: *mut core::ffi::c_void,
+    ) -> Result<HWND> {
+        let selector = unsafe {
+            create_control(
+                parent,
+                instance,
+                "COMBOBOX",
+                "",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | CBS_DROPDOWNLIST as u32,
+                x,
+                y,
+                width,
+                160,
+                id,
+                font,
+            )
+        }?;
+        for label in ["窗口化", "最大化", "全屏"] {
+            let label = wide(label);
+            unsafe {
+                SendMessageW(selector, CB_ADDSTRING, 0, label.as_ptr() as LPARAM);
+            }
+        }
+        unsafe {
+            SendMessageW(selector, CB_SETCURSEL, playback_mode_index(selected), 0);
+        }
+        Ok(selector)
+    }
+
+    fn playback_mode_index(mode: PlaybackMode) -> usize {
+        match mode {
+            PlaybackMode::Windowed => 0,
+            PlaybackMode::Maximized => 1,
+            PlaybackMode::Fullscreen => 2,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -544,7 +624,9 @@ mod platform {
             username: input.username,
             password: input.password,
         };
-        let skips = SkipSettings {
+        let settings = SkipSettings {
+            bring_to_front_on_start: unsafe { is_checked(state.bring_to_front_on_start) },
+            playback_mode: unsafe { selected_playback_mode(state.playback_mode) },
             intro: unsafe { is_checked(state.intro) },
             outro: unsafe { is_checked(state.outro) },
             recap: unsafe { is_checked(state.recap) },
@@ -556,8 +638,8 @@ mod platform {
             unsafe { show_error(hwnd, &format!("保存服务器登录信息失败：{error}")) };
             return;
         }
-        if let Err(error) = state.context.skip_settings.update(skips) {
-            unsafe { show_error(hwnd, &format!("保存跳过设置失败：{error}")) };
+        if let Err(error) = state.context.skip_settings.update(settings) {
+            unsafe { show_error(hwnd, &format!("保存本地设置失败：{error}")) };
             return;
         }
 
@@ -574,9 +656,9 @@ mod platform {
         let connection_changed = login != previous;
 
         let text = wide(if connection_changed {
-            "设置已保存，正在重新连接 Jellyfin。"
+            "设置已保存，正在重新连接 Jellyfin。播放窗口选项将在下次播放时生效。"
         } else {
-            "设置已保存。"
+            "设置已保存。播放窗口选项将在下次播放时生效。"
         });
         let title = wide("Jellyfin MPV 设置");
         unsafe {
@@ -603,6 +685,14 @@ mod platform {
 
     unsafe fn is_checked(hwnd: HWND) -> bool {
         unsafe { SendMessageW(hwnd, BM_GETCHECK, 0, 0) as u32 == BST_CHECKED }
+    }
+
+    unsafe fn selected_playback_mode(hwnd: HWND) -> PlaybackMode {
+        match unsafe { SendMessageW(hwnd, CB_GETCURSEL, 0, 0) as i32 } {
+            0 => PlaybackMode::Windowed,
+            2 => PlaybackMode::Fullscreen,
+            _ => PlaybackMode::Maximized,
+        }
     }
 
     unsafe fn control_text(hwnd: HWND) -> String {
