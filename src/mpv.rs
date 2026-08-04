@@ -254,6 +254,13 @@ pub struct Overlay {
 
 enum MpvCommand {
     Headers(Vec<String>),
+    ReplaceStream {
+        url: String,
+        headers: Vec<String>,
+        start_seconds: f64,
+        subtitle_url: Option<String>,
+        quality_selection: MpvQualitySelection,
+    },
     Pause(bool),
     Seek(f64),
     Volume(f64),
@@ -281,6 +288,26 @@ pub struct MpvHandle {
 impl MpvHandle {
     pub async fn set_http_headers(&self, headers: Vec<String>) -> Result<()> {
         self.send(MpvCommand::Headers(headers)).await
+    }
+
+    /// 在现有 mpv 进程中替换播放流。mpv 会重新缓冲和初始化解码器，但不会
+    /// 关闭窗口或主动修改暂停状态。
+    pub async fn replace_stream(
+        &self,
+        url: Url,
+        headers: Vec<String>,
+        start_seconds: f64,
+        subtitle_url: Option<Url>,
+        quality_selection: MpvQualitySelection,
+    ) -> Result<()> {
+        self.send(MpvCommand::ReplaceStream {
+            url: url.into(),
+            headers,
+            start_seconds,
+            subtitle_url: subtitle_url.map(Into::into),
+            quality_selection,
+        })
+        .await
     }
 
     pub async fn set_pause(&self, paused: bool) -> Result<()> {
@@ -539,6 +566,12 @@ fn mpv_boolean_option(name: &str, value: bool) -> OsString {
     OsString::from(format!("{name}={}", if value { "yes" } else { "no" }))
 }
 
+struct PendingLoad {
+    start_seconds: f64,
+    subtitle_url: Option<String>,
+    quality_selection: MpvQualitySelection,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_actor(
     id: Uuid,
@@ -563,6 +596,12 @@ async fn run_actor(
     let mut next_request_id = 10_000_u64;
     let mut pending_overlay_commands = HashMap::new();
     let mut needs_initial_activation = bring_to_front_on_start;
+    let mut pending_load = Some(PendingLoad {
+        start_seconds,
+        subtitle_url: subtitle_url.map(Into::into),
+        quality_selection,
+    });
+    let mut replacing_stream = false;
 
     send_json(
         &mut writer,
@@ -597,6 +636,26 @@ async fn run_actor(
                     break;
                 };
                 match command {
+                    MpvCommand::ReplaceStream {
+                        url,
+                        headers,
+                        start_seconds,
+                        subtitle_url,
+                        quality_selection,
+                    } => {
+                        pending_load = Some(
+                            load_replacement_stream(
+                                &mut writer,
+                                url,
+                                headers,
+                                start_seconds,
+                                subtitle_url,
+                                quality_selection,
+                            )
+                            .await?,
+                        );
+                        replacing_stream = true;
+                    }
                     MpvCommand::AddOverlay { overlay, completed } => {
                         let request_id = next_request_id;
                         next_request_id = next_request_id.wrapping_add(1);
@@ -627,35 +686,46 @@ async fn run_actor(
                             continue;
                         }
                         if value.get("event").and_then(Value::as_str) == Some("file-loaded") {
+                            let pending = pending_load.take().unwrap_or(PendingLoad {
+                                start_seconds: 0.0,
+                                subtitle_url: None,
+                                quality_selection: MpvQualitySelection::Auto,
+                            });
                             set_window_state(&mut writer, &window_title, window_state).await?;
                             if needs_initial_activation {
                                 bring_mpv_window_to_front(child.id());
                                 needs_initial_activation = false;
                             }
-                            if start_seconds > 0.0 {
+                            if pending.start_seconds > 0.0 {
                                 send_json(
                                     &mut writer,
-                                    json!({"command": ["seek", start_seconds, "absolute", "exact"]}),
+                                    json!({"command": ["seek", pending.start_seconds, "absolute", "exact"]}),
                                 ).await?;
                             }
-                            if let Some(subtitle_url) = subtitle_url.as_ref() {
+                            if let Some(subtitle_url) = pending.subtitle_url.as_ref() {
                                 send_json(
                                     &mut writer,
-                                    json!({"command": ["sub-add", subtitle_url.as_str(), "select"]}),
+                                    json!({"command": ["sub-add", subtitle_url, "select"]}),
                                 ).await?;
                             }
                             if let Some((width, height)) = thumbnail_size {
                                 configure_thumbnail_script(&mut writer, width, height).await?;
                             }
-                            configure_quality_menu(&mut writer, quality_selection).await?;
+                            configure_quality_menu(&mut writer, pending.quality_selection).await?;
+                            replacing_stream = false;
                             let _ = events.send(MpvEvent::FileLoaded { id }).await;
                         } else if value.get("event").and_then(Value::as_str) == Some("property-change") {
                             emit_property(id, &value, &events).await;
                         } else if value.get("event").and_then(Value::as_str) == Some("client-message") {
                             emit_client_message(id, &value, &events).await;
                         } else if value.get("event").and_then(Value::as_str) == Some("end-file") {
-                            let failed = value.get("reason").and_then(Value::as_str) == Some("error");
-                            let _ = events.send(MpvEvent::Ended { id, failed }).await;
+                            let reason = value.get("reason").and_then(Value::as_str);
+                            if is_replaced_stream_end(reason, replacing_stream) {
+                                debug!(?reason, "忽略同一 mpv 进程换流产生的旧流结束事件");
+                            } else {
+                                let failed = reason == Some("error");
+                                let _ = events.send(MpvEvent::Ended { id, failed }).await;
+                            }
                         } else if value.get("event").and_then(Value::as_str) == Some("shutdown") {
                             break;
                         }
@@ -762,6 +832,29 @@ async fn configure_quality_menu<W: AsyncWrite + Unpin>(
     .await
 }
 
+async fn load_replacement_stream<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    url: String,
+    headers: Vec<String>,
+    start_seconds: f64,
+    subtitle_url: Option<String>,
+    quality_selection: MpvQualitySelection,
+) -> Result<PendingLoad> {
+    send_json(
+        writer,
+        json!({"command": ["set_property", "http-header-fields", headers]}),
+    )
+    .await?;
+    configure_quality_menu(writer, quality_selection).await?;
+    send_json(writer, json!({"command": ["sub-remove"]})).await?;
+    send_json(writer, json!({"command": ["loadfile", url, "replace"]})).await?;
+    Ok(PendingLoad {
+        start_seconds,
+        subtitle_url,
+        quality_selection,
+    })
+}
+
 async fn set_window_state<W: AsyncWrite + Unpin>(
     writer: &mut W,
     title: &str,
@@ -815,12 +908,18 @@ async fn send_mpv_command<W: AsyncWrite + Unpin>(
             json!({"command": ["sub-add", url, "select"]})
         }
         MpvCommand::DisableSubtitle => json!({"command": ["set_property", "sid", "no"]}),
-        MpvCommand::AddOverlay { .. } | MpvCommand::RemoveOverlay(_) => {
-            unreachable!("覆盖层命令由 mpv actor 单独处理")
+        MpvCommand::ReplaceStream { .. }
+        | MpvCommand::AddOverlay { .. }
+        | MpvCommand::RemoveOverlay(_) => {
+            unreachable!("换流和覆盖层命令由 mpv actor 单独处理")
         }
         MpvCommand::Quit => json!({"command": ["quit"]}),
     };
     send_json(writer, value).await
+}
+
+fn is_replaced_stream_end(reason: Option<&str>, replacing_stream: bool) -> bool {
+    replacing_stream && reason == Some("stop")
 }
 
 async fn send_json<W: AsyncWrite + Unpin>(writer: &mut W, value: Value) -> Result<()> {
@@ -1149,6 +1248,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replaces_stream_without_sending_a_pause_command() {
+        let (mut writer, mut reader) = duplex(1024);
+        let pending = load_replacement_stream(
+            &mut writer,
+            "https://example.test/Videos/item/stream.ts".to_owned(),
+            vec!["X-Emby-Token: fresh-token".to_owned()],
+            123.5,
+            Some("https://example.test/Videos/item/subtitles/1.srt".to_owned()),
+            MpvQualitySelection::Resolution {
+                width: 1_280,
+                height: 720,
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let messages: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(
+            messages[0]["command"],
+            json!([
+                "set_property",
+                "http-header-fields",
+                ["X-Emby-Token: fresh-token"]
+            ])
+        );
+        assert_eq!(messages[1]["command"][0], "script-message");
+        assert_eq!(messages[2]["command"], json!(["sub-remove"]));
+        assert_eq!(
+            messages[3]["command"],
+            json!([
+                "loadfile",
+                "https://example.test/Videos/item/stream.ts",
+                "replace"
+            ])
+        );
+        assert!(messages.iter().all(|message| {
+            message["command"] != json!(["set_property", "pause", true])
+                && message["command"] != json!(["set_property", "pause", false])
+        }));
+        assert_eq!(pending.start_seconds, 123.5);
+        assert_eq!(
+            pending.subtitle_url.as_deref(),
+            Some("https://example.test/Videos/item/subtitles/1.srt")
+        );
+        assert_eq!(
+            pending.quality_selection,
+            MpvQualitySelection::Resolution {
+                width: 1_280,
+                height: 720,
+            }
+        );
+    }
+
+    #[test]
+    fn suppresses_only_the_stop_event_for_a_replaced_stream() {
+        assert!(is_replaced_stream_end(Some("stop"), true));
+        assert!(!is_replaced_stream_end(Some("error"), true));
+        assert!(!is_replaced_stream_end(Some("stop"), false));
+    }
+
+    #[tokio::test]
     async fn emits_subtitle_load_and_disable_commands() {
         let (mut writer, mut reader) = duplex(1024);
         send_mpv_command(
@@ -1411,9 +1578,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_quality_menu_uses_f9() {
+    fn embedded_quality_menu_has_keyboard_and_clickable_entry_points() {
         let script = std::str::from_utf8(include_bytes!("quality_menu.lua")).unwrap();
         assert!(script.contains("\"F9\""));
         assert!(script.contains("jellyfin-mpv-quality"));
+        assert!(script.contains("mp.create_osd_overlay"));
+        assert!(script.contains("mp.set_mouse_area"));
+        assert!(script.contains("jellyfin-mpv-quality-button"));
     }
 }

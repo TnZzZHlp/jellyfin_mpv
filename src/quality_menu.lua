@@ -20,6 +20,12 @@ local visible = false
 local selected = 1
 local current_id = "auto"
 local current_label = "自动（不限制）"
+local button_overlay = mp.create_osd_overlay("ass-events")
+local button_section = "jellyfin-mpv-quality-button"
+local button_x = 18
+local button_y = 18
+local button_width = 250
+local button_height = 42
 
 local function broadcast(name, ...)
     mp.commandv("script-message", name, ...)
@@ -36,6 +42,51 @@ local function select_current_entry()
         end
     end
     return 1
+end
+
+local function quality_button_label()
+    if current_id == "auto" then
+        return "质量 · 自动"
+    end
+
+    local label = current_label
+        :gsub("码率上限：", "")
+        :gsub("分辨率上限：", "")
+    return "质量 · " .. label
+end
+
+local function render_quality_button()
+    local width, height = mp.get_osd_size()
+    if not width or not height or width <= 0 or height <= 0 then
+        button_overlay.data = ""
+        button_overlay:update()
+        mp.set_mouse_area(0, 0, 0, 0, button_section)
+        return
+    end
+
+    button_overlay.res_x = width
+    button_overlay.res_y = height
+    button_overlay.z = 1001
+    button_overlay.data = string.format(
+        "{\\an7\\pos(%d,%d)\\p1\\1c&H202020&\\1a&H10&\\bord1\\3c&HFFFFFF&\\3a&H80&}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}{\\an7\\pos(%d,%d)\\fs22\\bord2\\3c&H000000&} %s",
+        button_x,
+        button_y,
+        button_width,
+        button_width,
+        button_height,
+        button_height,
+        button_x + 12,
+        button_y + 8,
+        quality_button_label()
+    )
+    button_overlay:update()
+    mp.set_mouse_area(
+        button_x,
+        button_y,
+        button_x + button_width,
+        button_y + button_height,
+        button_section
+    )
 end
 
 local function render()
@@ -79,6 +130,7 @@ local function apply_selection()
     local entry = selected_entry()
     current_id = entry.id
     current_label = entry.label
+    render_quality_button()
     close_menu()
     mp.osd_message("Jellyfin MPV\n正在切换：" .. entry.label, 3)
     broadcast("jellyfin-mpv-quality", entry.id)
@@ -107,12 +159,27 @@ local function toggle_menu()
 end
 
 mp.add_forced_key_binding("F9", "jellyfin-mpv-quality-menu", toggle_menu)
+mp.set_key_bindings({
+    { "MBTN_LEFT", toggle_menu },
+}, button_section, "force")
+mp.enable_key_bindings(button_section)
+
+mp.observe_property("osd-dimensions", "native", render_quality_button)
 
 mp.register_script_message("jellyfin-mpv-quality-selected", function(id, label)
     current_id = id or "auto"
     current_label = label or "自动（不限制）"
+    render_quality_button()
     if visible then
         selected = select_current_entry()
         render()
     end
 end)
+
+mp.register_event("shutdown", function()
+    mp.set_mouse_area(0, 0, 0, 0, button_section)
+    mp.disable_key_bindings(button_section)
+    button_overlay:remove()
+end)
+
+render_quality_button()

@@ -1,4 +1,10 @@
-use std::{collections::HashMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, anyhow, bail};
 use tokio::{
@@ -16,8 +22,9 @@ use crate::{
         PlaybackReport, PlaybackStopReport, RemoteCommand, RepeatMode,
     },
     skip_settings::{SkipSettings, SkipSettingsStore},
-    thumbnail::{ThumbnailWorker, select_trickplay},
+    thumbnail::{ThumbnailWorker, TrickplayProfile, select_trickplay},
 };
+use url::Url;
 
 const MEDIA_SEGMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -58,6 +65,28 @@ struct Playback {
     playback_rate: f64,
     playback_constraints: PlaybackConstraints,
     started: bool,
+    skip_segments: Vec<SkipSegment>,
+    last_position_update: Instant,
+}
+
+struct PreparedPlayback {
+    item_id: String,
+    playlist_item_id: String,
+    item_name: String,
+    media_source_id: String,
+    play_session_id: String,
+    live_stream_id: Option<String>,
+    play_method: &'static str,
+    audio_stream_index: Option<i32>,
+    subtitle_stream_index: Option<i32>,
+    media_streams: Vec<MediaStream>,
+    required_http_headers: HashMap<String, Option<String>>,
+    auth_generation: u64,
+    url: Url,
+    headers: Vec<String>,
+    subtitle_url: Option<Url>,
+    thumbnail_profile: Option<TrickplayProfile>,
+    start_ticks: i64,
     skip_segments: Vec<SkipSegment>,
 }
 
@@ -283,6 +312,73 @@ impl Playback {
                 .then_some(self.playlist_item_id.as_str()),
         }
     }
+
+    fn estimated_position_ticks(&self) -> i64 {
+        if self.paused || !self.playback_rate.is_finite() || self.playback_rate <= 0.0 {
+            return self.position_ticks.max(0);
+        }
+
+        let elapsed_ticks = (self.last_position_update.elapsed().as_secs_f64()
+            * self.playback_rate
+            * 10_000_000.0) as i64;
+        self.position_ticks.saturating_add(elapsed_ticks).max(0)
+    }
+}
+
+fn playback_from_prepared(
+    mpv: MpvHandle,
+    thumbnail: Option<ThumbnailWorker>,
+    prepared: PreparedPlayback,
+    preferences: PlaybackPreferences,
+    playback_constraints: PlaybackConstraints,
+) -> Playback {
+    let PreparedPlayback {
+        item_id,
+        playlist_item_id,
+        item_name,
+        media_source_id,
+        play_session_id,
+        live_stream_id,
+        play_method,
+        audio_stream_index,
+        subtitle_stream_index,
+        media_streams,
+        required_http_headers,
+        auth_generation,
+        url: _,
+        headers: _,
+        subtitle_url: _,
+        thumbnail_profile: _,
+        start_ticks,
+        skip_segments,
+    } = prepared;
+
+    Playback {
+        mpv,
+        item_id,
+        playlist_item_id,
+        item_name,
+        media_source_id,
+        play_session_id,
+        live_stream_id,
+        play_method,
+        audio_stream_index,
+        audio_track_ids: HashMap::new(),
+        subtitle_stream_index,
+        media_streams,
+        thumbnail,
+        required_http_headers,
+        auth_generation,
+        position_ticks: start_ticks,
+        paused: preferences.paused,
+        muted: preferences.muted,
+        volume: preferences.volume,
+        playback_rate: preferences.playback_rate,
+        playback_constraints,
+        started: false,
+        skip_segments,
+        last_position_update: Instant::now(),
+    }
 }
 
 impl Player {
@@ -399,6 +495,7 @@ impl Player {
                 let ticks = ticks.max(0);
                 playback.mpv.seek(ticks as f64 / 10_000_000.0).await?;
                 playback.position_ticks = ticks;
+                playback.last_position_update = Instant::now();
                 mark_passed_skip_segments(&mut playback.skip_segments, ticks);
                 self.report_progress().await;
                 Ok(())
@@ -532,7 +629,90 @@ impl Player {
             .map(|item| (item.id.clone(), item.playlist_item_id.clone()))
             .ok_or_else(|| anyhow!("当前播放队列为空"))?;
         let start_ticks = options.start_ticks.max(0);
+        let preferences = options.preferences;
+        let prepared = self
+            .prepare_playback(
+                item_id,
+                playlist_item_id,
+                start_ticks,
+                options.media_source_id,
+                options.audio_stream_index,
+                options.subtitle_stream_index,
+            )
+            .await?;
+        let playback_settings = self.skip_settings.snapshot();
+        let mpv = match spawn_mpv(MpvLaunch {
+            executable: self.mpv_path.clone(),
+            extra_args: self.mpv_args.clone(),
+            window_title: prepared.item_name.clone(),
+            bring_to_front_on_start: playback_settings.bring_to_front_on_start,
+            playback_mode: playback_settings.playback_mode,
+            url: prepared.url.clone(),
+            headers: prepared.headers.clone(),
+            start_seconds: prepared.start_ticks as f64 / 10_000_000.0,
+            subtitle_url: prepared.subtitle_url.clone(),
+            thumbnail_size: prepared
+                .thumbnail_profile
+                .as_ref()
+                .map(TrickplayProfile::display_size),
+            quality_selection: quality_selection_for(self.playback_constraints),
+            events: self.mpv_events.clone(),
+        })
+        .await
+        {
+            Ok(mpv) => mpv,
+            Err(error) => return Err(error),
+        };
 
+        let thumbnail = if let Some(profile) = prepared.thumbnail_profile.clone() {
+            match ThumbnailWorker::start(self.client.clone(), mpv.clone(), profile).await {
+                Ok(worker) => Some(worker),
+                Err(error) => {
+                    warn!(%error, item_id = %prepared.item_id, "初始化 Trickplay 缩略图失败，继续普通播放");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let playback_mpv = mpv.clone();
+        info!(item = %prepared.item_name, item_id = %prepared.item_id, method = prepared.play_method, "正在启动播放");
+        self.playback = Some(playback_from_prepared(
+            mpv,
+            thumbnail,
+            prepared,
+            preferences,
+            self.playback_constraints,
+        ));
+
+        if preferences.volume != 100.0 {
+            playback_mpv.set_volume(preferences.volume).await?;
+        }
+        if preferences.muted {
+            playback_mpv.set_mute(true).await?;
+        }
+        if (preferences.playback_rate - 1.0).abs() > f64::EPSILON {
+            playback_mpv
+                .set_playback_rate(preferences.playback_rate)
+                .await?;
+        }
+        if preferences.paused {
+            playback_mpv.set_pause(true).await?;
+        }
+        Ok(())
+    }
+
+    async fn prepare_playback(
+        &self,
+        item_id: String,
+        playlist_item_id: String,
+        start_ticks: i64,
+        media_source_id: Option<String>,
+        audio_stream_index: Option<i32>,
+        subtitle_stream_index: Option<i32>,
+    ) -> Result<PreparedPlayback> {
+        let start_ticks = start_ticks.max(0);
         info!(%item_id, "正在处理 Jellyfin 播放命令");
         let item = self.client.item(&self.user_id, &item_id).await?;
         let info = self
@@ -541,9 +721,9 @@ impl Player {
                 &self.user_id,
                 &item_id,
                 start_ticks,
-                options.media_source_id.as_deref(),
-                options.audio_stream_index,
-                options.subtitle_stream_index,
+                media_source_id.as_deref(),
+                audio_stream_index,
+                subtitle_stream_index,
                 self.playback_constraints,
             )
             .await?;
@@ -563,8 +743,7 @@ impl Player {
                     Vec::new()
                 }
             };
-        let source = options
-            .media_source_id
+        let source = media_source_id
             .as_deref()
             .and_then(|wanted| {
                 info.media_sources
@@ -594,10 +773,8 @@ impl Player {
             .client
             .mpv_http_headers(&source.required_http_headers)
             .await;
-        let audio_stream_index = options
-            .audio_stream_index
-            .or(source.default_audio_stream_index);
-        let subtitle_stream_index = match options.subtitle_stream_index {
+        let audio_stream_index = audio_stream_index.or(source.default_audio_stream_index);
+        let subtitle_stream_index = match subtitle_stream_index {
             Some(index) => (index >= 0).then_some(index),
             None => source
                 .default_subtitle_stream_index
@@ -613,84 +790,28 @@ impl Player {
             .map(|stream| self.client.subtitle_url(&item.id, &source_id, stream))
             .transpose()?
             .flatten();
-        let media_streams = source.media_streams.clone();
-        let trickplay = select_trickplay(&item, &source_id);
-        let playback_settings = self.skip_settings.snapshot();
-        let mpv = match spawn_mpv(MpvLaunch {
-            executable: self.mpv_path.clone(),
-            extra_args: self.mpv_args.clone(),
-            window_title: item.name.clone(),
-            bring_to_front_on_start: playback_settings.bring_to_front_on_start,
-            playback_mode: playback_settings.playback_mode,
-            url,
-            headers,
-            start_seconds: start_ticks as f64 / 10_000_000.0,
-            subtitle_url,
-            thumbnail_size: trickplay.as_ref().map(|profile| profile.display_size()),
-            quality_selection: quality_selection_for(self.playback_constraints),
-            events: self.mpv_events.clone(),
-        })
-        .await
-        {
-            Ok(mpv) => mpv,
-            Err(error) => return Err(error),
-        };
+        let thumbnail_profile = select_trickplay(&item, &source_id);
 
-        let thumbnail = if let Some(profile) = trickplay {
-            match ThumbnailWorker::start(self.client.clone(), mpv.clone(), profile).await {
-                Ok(worker) => Some(worker),
-                Err(error) => {
-                    warn!(%error, %item_id, "初始化 Trickplay 缩略图失败，继续普通播放");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let playback_mpv = mpv.clone();
-        info!(item = %item.name, item_id = %item.id, method = play_method, "正在启动播放");
-        self.playback = Some(Playback {
-            mpv,
+        Ok(PreparedPlayback {
             item_id: item.id,
             playlist_item_id,
             item_name: item.name,
-            media_source_id: source_id,
+            media_source_id: source_id.clone(),
             play_session_id,
             live_stream_id: source.live_stream_id.clone(),
             play_method,
             audio_stream_index,
-            audio_track_ids: HashMap::new(),
             subtitle_stream_index,
-            media_streams,
-            thumbnail,
+            media_streams: source.media_streams.clone(),
             required_http_headers: source.required_http_headers.clone(),
             auth_generation,
-            position_ticks: start_ticks,
-            paused: options.preferences.paused,
-            muted: options.preferences.muted,
-            volume: options.preferences.volume,
-            playback_rate: options.preferences.playback_rate,
-            playback_constraints: self.playback_constraints,
-            started: false,
+            url,
+            headers,
+            subtitle_url,
+            thumbnail_profile,
+            start_ticks,
             skip_segments,
-        });
-
-        if options.preferences.volume != 100.0 {
-            playback_mpv.set_volume(options.preferences.volume).await?;
-        }
-        if options.preferences.muted {
-            playback_mpv.set_mute(true).await?;
-        }
-        if (options.preferences.playback_rate - 1.0).abs() > f64::EPSILON {
-            playback_mpv
-                .set_playback_rate(options.preferences.playback_rate)
-                .await?;
-        }
-        if options.preferences.paused {
-            playback_mpv.set_pause(true).await?;
-        }
-        Ok(())
+        })
     }
 
     async fn move_queue(&mut self, next: bool) -> Result<()> {
@@ -778,21 +899,111 @@ impl Player {
         }
 
         self.playback_constraints = constraints;
-        let Some(playback) = self.playback.as_ref() else {
+        let Some((
+            item_id,
+            playlist_item_id,
+            media_source_id,
+            audio_stream_index,
+            subtitle_stream_index,
+            preferences,
+            mpv,
+            start_ticks,
+        )) = self.playback.as_ref().map(|playback| {
+            (
+                playback.item_id.clone(),
+                playback.playlist_item_id.clone(),
+                playback.media_source_id.clone(),
+                playback.audio_stream_index,
+                playback.subtitle_stream_index,
+                PlaybackPreferences {
+                    paused: playback.paused,
+                    muted: playback.muted,
+                    volume: playback.volume,
+                    playback_rate: playback.playback_rate,
+                },
+                playback.mpv.clone(),
+                playback.estimated_position_ticks(),
+            )
+        })
+        else {
             info!(?constraints, "已保存下次播放使用的质量限制");
             return Ok(());
         };
-        let options = StartOptions {
-            start_ticks: playback.position_ticks,
-            media_source_id: Some(playback.media_source_id.clone()),
-            audio_stream_index: playback.audio_stream_index,
-            subtitle_stream_index: playback.subtitle_stream_index,
-            preferences: self.playback_preferences(),
+
+        // 先在旧流继续播放时向 Jellyfin 请求新 PlaybackInfo，再在同一个 mpv
+        // 进程中替换 URL。这样不会关闭窗口，也不会主动发送暂停命令。
+        let mut prepared = self
+            .prepare_playback(
+                item_id,
+                playlist_item_id,
+                start_ticks,
+                Some(media_source_id),
+                audio_stream_index,
+                subtitle_stream_index,
+            )
+            .await?;
+        if let Some(playback) = self.playback.as_ref() {
+            let resume_ticks = playback.estimated_position_ticks();
+            prepared.start_ticks = resume_ticks;
+            mark_passed_skip_segments(&mut prepared.skip_segments, resume_ticks);
+        }
+
+        mpv.replace_stream(
+            prepared.url.clone(),
+            prepared.headers.clone(),
+            prepared.start_ticks as f64 / 10_000_000.0,
+            prepared.subtitle_url.clone(),
+            quality_selection_for(constraints),
+        )
+        .await?;
+
+        let mut previous = self.playback.take().expect("换流前播放状态仍然存在");
+        let source_changed = previous.media_source_id != prepared.media_source_id;
+        if previous.started {
+            let queue = self
+                .queue
+                .as_ref()
+                .map(|queue| queue.items.as_slice())
+                .unwrap_or(&[]);
+            let report = previous.stop_report(false, queue);
+            if let Err(error) = self.client.report_stop(&report).await {
+                warn!(%error, "上报质量切换前的 Jellyfin 停止播放失败");
+            }
+        }
+
+        let thumbnail = if source_changed {
+            if let Some(thumbnail) = previous.thumbnail.take() {
+                thumbnail.stop().await;
+            }
+            match prepared.thumbnail_profile.clone() {
+                Some(profile) => {
+                    match ThumbnailWorker::start(self.client.clone(), mpv.clone(), profile).await {
+                        Ok(worker) => Some(worker),
+                        Err(error) => {
+                            warn!(%error, item_id = %prepared.item_id, "更新 Trickplay 缩略图失败，继续普通播放");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            previous.thumbnail.take()
         };
 
-        self.stop_current(false).await;
-        self.start_current(options).await?;
-        info!(?constraints, "已重新建立播放流以应用质量限制");
+        info!(
+            item = %prepared.item_name,
+            method = prepared.play_method,
+            ?constraints,
+            "已在现有 mpv 进程中切换播放质量"
+        );
+        self.playback = Some(playback_from_prepared(
+            mpv,
+            thumbnail,
+            prepared,
+            preferences,
+            constraints,
+        ));
         Ok(())
     }
 
@@ -1024,6 +1235,7 @@ impl Player {
                 return Ok(());
             }
             playback.position_ticks = position_ticks;
+            playback.last_position_update = Instant::now();
             next_skip_target(&mut playback.skip_segments, position_ticks, &settings)
         };
 
@@ -1036,6 +1248,7 @@ impl Player {
             .seek(target_ticks as f64 / 10_000_000.0)
             .await?;
         playback.position_ticks = target_ticks;
+        playback.last_position_update = Instant::now();
         info!(
             segment_type = %kind,
             target_seconds = target_ticks as f64 / 10_000_000.0,
