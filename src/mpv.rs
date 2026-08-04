@@ -1615,12 +1615,11 @@ mod tests {
     }
 
     #[test]
-    fn embedded_quality_menu_has_keyboard_and_clickable_entry_points() {
+    fn embedded_quality_menu_uses_f9_without_a_mouse_button() {
         let script = std::str::from_utf8(include_bytes!("quality_menu.lua")).unwrap();
         assert!(script.contains("\"F9\""));
         assert!(script.contains("jellyfin-mpv-quality"));
-        assert!(script.contains("mp.create_osd_overlay"));
-        assert!(script.contains("mp.set_mouse_area"));
-        assert!(script.contains("jellyfin-mpv-quality-button"));
+        assert!(!script.contains("mp.set_mouse_area"));
+        assert!(!script.contains("jellyfin-mpv-quality-button"));
     }
 }
