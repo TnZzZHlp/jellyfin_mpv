@@ -5,18 +5,13 @@ use serde::{Deserialize, Serialize};
 
 pub const ALL_SEGMENT_TYPES: [&str; 5] = ["Intro", "Outro", "Recap", "Preview", "Commercial"];
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlaybackMode {
     Windowed,
+    #[default]
     Maximized,
     Fullscreen,
-}
-
-impl Default for PlaybackMode {
-    fn default() -> Self {
-        Self::Maximized
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

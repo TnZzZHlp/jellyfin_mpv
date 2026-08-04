@@ -12,7 +12,8 @@ use crate::{
     jellyfin::JellyfinClient,
     mpv::{MpvEvent, MpvHandle, MpvLaunch, spawn_mpv},
     protocol::{
-        MediaSegment, MediaStream, PlayRequest, PlaybackReport, PlaybackStopReport, RemoteCommand,
+        MediaSegment, MediaStream, PlayCommand, PlayRequest, PlaybackOrder, PlaybackQueueItem,
+        PlaybackReport, PlaybackStopReport, RemoteCommand, RepeatMode,
     },
     skip_settings::{SkipSettings, SkipSettingsStore},
     thumbnail::{ThumbnailWorker, select_trickplay},
@@ -28,11 +29,16 @@ pub struct Player {
     mpv_events: mpsc::Sender<MpvEvent>,
     skip_settings: Arc<SkipSettingsStore>,
     playback: Option<Playback>,
+    queue: Option<PlaybackQueue>,
+    repeat_mode: RepeatMode,
+    playback_order: PlaybackOrder,
+    max_streaming_bitrate: Option<u64>,
 }
 
 struct Playback {
     mpv: MpvHandle,
     item_id: String,
+    playlist_item_id: String,
     item_name: String,
     media_source_id: String,
     play_session_id: String,
@@ -49,8 +55,178 @@ struct Playback {
     paused: bool,
     muted: bool,
     volume: f64,
+    playback_rate: f64,
+    max_streaming_bitrate: Option<u64>,
     started: bool,
     skip_segments: Vec<SkipSegment>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlaybackPreferences {
+    paused: bool,
+    muted: bool,
+    volume: f64,
+    playback_rate: f64,
+}
+
+impl Default for PlaybackPreferences {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            muted: false,
+            volume: 100.0,
+            playback_rate: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StartOptions {
+    start_ticks: i64,
+    media_source_id: Option<String>,
+    audio_stream_index: Option<i32>,
+    subtitle_stream_index: Option<i32>,
+    preferences: PlaybackPreferences,
+}
+
+#[derive(Debug, Clone)]
+struct PlaybackQueue {
+    items: Vec<PlaybackQueueItem>,
+    sorted_items: Vec<PlaybackQueueItem>,
+    current_index: usize,
+}
+
+impl PlaybackQueue {
+    fn new(item_ids: Vec<String>, start_index: usize, shuffled: bool) -> Result<Self> {
+        if item_ids.is_empty() {
+            bail!("播放命令没有 ItemIds");
+        }
+
+        let sorted_items = item_ids
+            .into_iter()
+            .map(|id| PlaybackQueueItem {
+                id,
+                playlist_item_id: Uuid::new_v4().to_string(),
+            })
+            .collect::<Vec<_>>();
+        let mut items = sorted_items.clone();
+        let current_index = if shuffled {
+            shuffle_items(&mut items);
+            0
+        } else {
+            if start_index < items.len() {
+                start_index
+            } else {
+                0
+            }
+        };
+
+        Ok(Self {
+            items,
+            sorted_items,
+            current_index,
+        })
+    }
+
+    fn current(&self) -> Option<&PlaybackQueueItem> {
+        self.items.get(self.current_index)
+    }
+
+    fn next_index(&self, repeat_mode: RepeatMode) -> Option<usize> {
+        if self.items.is_empty() {
+            return None;
+        }
+        if self.current_index + 1 < self.items.len() {
+            return Some(self.current_index + 1);
+        }
+        match repeat_mode {
+            RepeatMode::RepeatAll => Some(0),
+            RepeatMode::RepeatOne => Some(self.current_index),
+            RepeatMode::RepeatNone => None,
+        }
+    }
+
+    fn previous_index(&self, repeat_mode: RepeatMode) -> Option<usize> {
+        if self.current_index > 0 {
+            return Some(self.current_index - 1);
+        }
+        match repeat_mode {
+            RepeatMode::RepeatAll => self.items.len().checked_sub(1),
+            RepeatMode::RepeatNone | RepeatMode::RepeatOne => None,
+        }
+    }
+
+    fn set_current(&mut self, index: usize) {
+        if !self.items.is_empty() {
+            self.current_index = index.min(self.items.len() - 1);
+        }
+    }
+
+    fn insert_next(&mut self, item_ids: Vec<String>) {
+        let entries = make_queue_items(item_ids);
+        if entries.is_empty() {
+            return;
+        }
+        let insertion = (self.current_index + 1).min(self.items.len());
+        self.items.splice(insertion..insertion, entries.clone());
+        self.sorted_items.extend(entries);
+    }
+
+    fn append(&mut self, item_ids: Vec<String>) {
+        let entries = make_queue_items(item_ids);
+        if entries.is_empty() {
+            return;
+        }
+        self.items.extend(entries.clone());
+        self.sorted_items.extend(entries);
+    }
+
+    fn set_order(&mut self, order: PlaybackOrder) {
+        let Some(current) = self.current().cloned() else {
+            return;
+        };
+
+        match order {
+            PlaybackOrder::Default => {
+                self.items = self.sorted_items.clone();
+                self.current_index = self
+                    .items
+                    .iter()
+                    .position(|item| item.playlist_item_id == current.playlist_item_id)
+                    .unwrap_or(0);
+            }
+            PlaybackOrder::Shuffle => {
+                let mut remaining = self
+                    .items
+                    .iter()
+                    .filter(|item| item.playlist_item_id != current.playlist_item_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                shuffle_items(&mut remaining);
+                self.items = Vec::with_capacity(remaining.len() + 1);
+                self.items.push(current);
+                self.items.extend(remaining);
+                self.current_index = 0;
+            }
+        }
+    }
+}
+
+fn make_queue_items(item_ids: Vec<String>) -> Vec<PlaybackQueueItem> {
+    item_ids
+        .into_iter()
+        .map(|id| PlaybackQueueItem {
+            id,
+            playlist_item_id: Uuid::new_v4().to_string(),
+        })
+        .collect()
+}
+
+fn shuffle_items<T>(items: &mut [T]) {
+    for index in (1..items.len()).rev() {
+        let random = Uuid::new_v4().as_u128() as usize;
+        items.swap(index, random % (index + 1));
+    }
 }
 
 #[derive(Debug)]
@@ -62,7 +238,12 @@ struct SkipSegment {
 }
 
 impl Playback {
-    fn report(&self) -> PlaybackReport<'_> {
+    fn report<'a>(
+        &'a self,
+        queue: &'a PlaybackQueue,
+        repeat_mode: RepeatMode,
+        playback_order: PlaybackOrder,
+    ) -> PlaybackReport<'a> {
         PlaybackReport {
             item_id: &self.item_id,
             media_source_id: &self.media_source_id,
@@ -76,10 +257,18 @@ impl Playback {
             play_method: self.play_method,
             audio_stream_index: self.audio_stream_index,
             subtitle_stream_index: self.subtitle_stream_index,
+            repeat_mode,
+            playback_order,
+            now_playing_queue: Some(&queue.items),
+            playlist_item_id: Some(&self.playlist_item_id),
         }
     }
 
-    fn stop_report(&self, failed: bool) -> PlaybackStopReport<'_> {
+    fn stop_report<'a>(
+        &'a self,
+        failed: bool,
+        queue: &'a [PlaybackQueueItem],
+    ) -> PlaybackStopReport<'a> {
         PlaybackStopReport {
             item_id: &self.item_id,
             media_source_id: &self.media_source_id,
@@ -87,6 +276,11 @@ impl Playback {
             live_stream_id: self.live_stream_id.as_deref(),
             position_ticks: self.position_ticks.max(0),
             failed,
+            now_playing_queue: Some(queue),
+            playlist_item_id: queue
+                .iter()
+                .any(|item| item.playlist_item_id == self.playlist_item_id)
+                .then_some(self.playlist_item_id.as_str()),
         }
     }
 }
@@ -108,6 +302,10 @@ impl Player {
             mpv_events,
             skip_settings,
             playback: None,
+            queue: None,
+            repeat_mode: RepeatMode::RepeatNone,
+            playback_order: PlaybackOrder::Default,
+            max_streaming_bitrate: None,
         }
     }
 
@@ -154,6 +352,7 @@ impl Player {
             }
         }
 
+        self.queue = None;
         self.stop_current(false).await;
         Ok(())
     }
@@ -162,6 +361,7 @@ impl Player {
         match command {
             RemoteCommand::Play(request) => self.play(request).await,
             RemoteCommand::Stop => {
+                self.queue = None;
                 self.stop_current(false).await;
                 Ok(())
             }
@@ -188,6 +388,8 @@ impl Player {
                 info!(paused, "播放暂停状态已切换");
                 Ok(())
             }
+            RemoteCommand::NextTrack => self.move_queue(true).await,
+            RemoteCommand::PreviousTrack => self.move_queue(false).await,
             RemoteCommand::Seek(ticks) => {
                 let playback = self.active_mut()?;
                 let ticks = ticks.max(0);
@@ -209,7 +411,10 @@ impl Player {
             RemoteCommand::VolumeDown => self.adjust_volume(-2.0).await,
             RemoteCommand::ToggleFullscreen => self.active_mut()?.mpv.toggle_fullscreen().await,
             RemoteCommand::PlaybackRate(rate) => {
-                self.active_mut()?.mpv.set_playback_rate(rate).await
+                let playback = self.active_mut()?;
+                playback.mpv.set_playback_rate(rate).await?;
+                playback.playback_rate = rate;
+                Ok(())
             }
             RemoteCommand::Mute(muted) => {
                 let playback = self.active_mut()?;
@@ -227,21 +432,104 @@ impl Player {
             }
             RemoteCommand::SetAudio(index) => self.set_audio(index).await,
             RemoteCommand::SetSubtitle(index) => self.set_subtitle(index).await,
+            RemoteCommand::SetRepeatMode(mode) => self.set_repeat_mode(mode).await,
+            RemoteCommand::SetShuffleMode(order) => self.set_playback_order(order).await,
+            RemoteCommand::SetMaxStreamingBitrate(bitrate) => {
+                self.set_max_streaming_bitrate(bitrate).await
+            }
         }
     }
 
     async fn play(&mut self, request: PlayRequest) -> Result<()> {
-        let index = request.start_index.unwrap_or(0);
-        let item_id = request
-            .item_ids
-            .get(index)
-            .or_else(|| request.item_ids.first())
-            .ok_or_else(|| anyhow!("播放命令没有 ItemIds"))?
-            .clone();
+        if request.item_ids.is_empty() {
+            bail!("播放命令没有 ItemIds");
+        }
+
         let start_ticks = request.start_position_ticks.unwrap_or(0).max(0);
+        match request.play_command {
+            PlayCommand::PlayNow | PlayCommand::PlayInstantMix | PlayCommand::PlayShuffle => {
+                if request.play_command == PlayCommand::PlayShuffle {
+                    self.playback_order = PlaybackOrder::Shuffle;
+                }
+                let shuffled = self.playback_order == PlaybackOrder::Shuffle;
+                self.queue = Some(PlaybackQueue::new(
+                    request.item_ids,
+                    request.start_index.unwrap_or(0),
+                    shuffled,
+                )?);
+                self.stop_current(false).await;
+                self.start_current(StartOptions {
+                    start_ticks,
+                    media_source_id: request.media_source_id,
+                    audio_stream_index: request.audio_stream_index,
+                    subtitle_stream_index: request.subtitle_stream_index,
+                    preferences: PlaybackPreferences::default(),
+                })
+                .await
+            }
+            PlayCommand::PlayNext => {
+                if self.playback.is_some() && self.queue.is_some() {
+                    self.queue
+                        .as_mut()
+                        .expect("播放存在时队列应存在")
+                        .insert_next(request.item_ids);
+                    self.report_progress().await;
+                    Ok(())
+                } else {
+                    self.queue = Some(PlaybackQueue::new(
+                        request.item_ids,
+                        request.start_index.unwrap_or(0),
+                        self.playback_order == PlaybackOrder::Shuffle,
+                    )?);
+                    self.stop_current(false).await;
+                    self.start_current(StartOptions {
+                        start_ticks,
+                        media_source_id: request.media_source_id,
+                        audio_stream_index: request.audio_stream_index,
+                        subtitle_stream_index: request.subtitle_stream_index,
+                        preferences: PlaybackPreferences::default(),
+                    })
+                    .await
+                }
+            }
+            PlayCommand::PlayLast => {
+                if self.playback.is_some() && self.queue.is_some() {
+                    self.queue
+                        .as_mut()
+                        .expect("播放存在时队列应存在")
+                        .append(request.item_ids);
+                    self.report_progress().await;
+                    Ok(())
+                } else {
+                    self.queue = Some(PlaybackQueue::new(
+                        request.item_ids,
+                        request.start_index.unwrap_or(0),
+                        self.playback_order == PlaybackOrder::Shuffle,
+                    )?);
+                    self.stop_current(false).await;
+                    self.start_current(StartOptions {
+                        start_ticks,
+                        media_source_id: request.media_source_id,
+                        audio_stream_index: request.audio_stream_index,
+                        subtitle_stream_index: request.subtitle_stream_index,
+                        preferences: PlaybackPreferences::default(),
+                    })
+                    .await
+                }
+            }
+        }
+    }
+
+    async fn start_current(&mut self, options: StartOptions) -> Result<()> {
+        let (item_id, playlist_item_id) = self
+            .queue
+            .as_ref()
+            .and_then(PlaybackQueue::current)
+            .map(|item| (item.id.clone(), item.playlist_item_id.clone()))
+            .ok_or_else(|| anyhow!("当前播放队列为空"))?;
+        let start_ticks = options.start_ticks.max(0);
 
         info!(%item_id, "正在处理 Jellyfin 播放命令");
-        self.stop_current(false).await;
         let item = self.client.item(&self.user_id, &item_id).await?;
         let info = self
             .client
@@ -249,9 +537,10 @@ impl Player {
                 &self.user_id,
                 &item_id,
                 start_ticks,
-                request.media_source_id.as_deref(),
-                request.audio_stream_index,
-                request.subtitle_stream_index,
+                options.media_source_id.as_deref(),
+                options.audio_stream_index,
+                options.subtitle_stream_index,
+                self.max_streaming_bitrate,
             )
             .await?;
         let skip_segments =
@@ -270,7 +559,7 @@ impl Player {
                     Vec::new()
                 }
             };
-        let source = request
+        let source = options
             .media_source_id
             .as_deref()
             .and_then(|wanted| {
@@ -301,10 +590,10 @@ impl Player {
             .client
             .mpv_http_headers(&source.required_http_headers)
             .await;
-        let audio_stream_index = request
+        let audio_stream_index = options
             .audio_stream_index
             .or(source.default_audio_stream_index);
-        let subtitle_stream_index = match request.subtitle_stream_index {
+        let subtitle_stream_index = match options.subtitle_stream_index {
             Some(index) => (index >= 0).then_some(index),
             None => source
                 .default_subtitle_stream_index
@@ -354,10 +643,12 @@ impl Player {
             None
         };
 
+        let playback_mpv = mpv.clone();
         info!(item = %item.name, item_id = %item.id, method = play_method, "正在启动播放");
         self.playback = Some(Playback {
             mpv,
             item_id: item.id,
+            playlist_item_id,
             item_name: item.name,
             media_source_id: source_id,
             play_session_id,
@@ -371,13 +662,121 @@ impl Player {
             required_http_headers: source.required_http_headers.clone(),
             auth_generation,
             position_ticks: start_ticks,
-            paused: false,
-            muted: false,
-            volume: 100.0,
+            paused: options.preferences.paused,
+            muted: options.preferences.muted,
+            volume: options.preferences.volume,
+            playback_rate: options.preferences.playback_rate,
+            max_streaming_bitrate: self.max_streaming_bitrate,
             started: false,
             skip_segments,
         });
+
+        if options.preferences.volume != 100.0 {
+            playback_mpv.set_volume(options.preferences.volume).await?;
+        }
+        if options.preferences.muted {
+            playback_mpv.set_mute(true).await?;
+        }
+        if (options.preferences.playback_rate - 1.0).abs() > f64::EPSILON {
+            playback_mpv
+                .set_playback_rate(options.preferences.playback_rate)
+                .await?;
+        }
+        if options.preferences.paused {
+            playback_mpv.set_pause(true).await?;
+        }
         Ok(())
+    }
+
+    async fn move_queue(&mut self, next: bool) -> Result<()> {
+        let target = {
+            let Some(queue) = self.queue.as_ref() else {
+                return Ok(());
+            };
+            if next {
+                queue.next_index(self.repeat_mode)
+            } else {
+                queue.previous_index(self.repeat_mode)
+            }
+        };
+        let Some(target) = target else {
+            return Ok(());
+        };
+
+        let mut preferences = self.playback_preferences();
+        preferences.paused = false;
+        if let Some(queue) = self.queue.as_mut() {
+            queue.set_current(target);
+        }
+        self.stop_current(false).await;
+        self.start_current(StartOptions {
+            preferences,
+            ..StartOptions::default()
+        })
+        .await
+    }
+
+    async fn set_repeat_mode(&mut self, mode: RepeatMode) -> Result<()> {
+        self.repeat_mode = mode;
+        if self.playback.is_some() {
+            self.report_progress().await;
+        }
+        info!(?mode, "播放重复模式已更新");
+        Ok(())
+    }
+
+    async fn set_playback_order(&mut self, order: PlaybackOrder) -> Result<()> {
+        self.playback_order = order;
+        if let Some(queue) = self.queue.as_mut() {
+            queue.set_order(order);
+        }
+        if self.playback.is_some() {
+            self.report_progress().await;
+        }
+        info!(?order, "播放顺序已更新");
+        Ok(())
+    }
+
+    async fn set_max_streaming_bitrate(&mut self, bitrate: u64) -> Result<()> {
+        let bitrate = bitrate.min(i32::MAX as u64);
+        if self.max_streaming_bitrate == Some(bitrate)
+            && self
+                .playback
+                .as_ref()
+                .is_some_and(|playback| playback.max_streaming_bitrate == Some(bitrate))
+        {
+            return Ok(());
+        }
+
+        self.max_streaming_bitrate = Some(bitrate);
+        let Some(playback) = self.playback.as_ref() else {
+            info!(bitrate, "已保存下次播放使用的最大码率");
+            return Ok(());
+        };
+        let options = StartOptions {
+            start_ticks: playback.position_ticks,
+            media_source_id: Some(playback.media_source_id.clone()),
+            audio_stream_index: playback.audio_stream_index,
+            subtitle_stream_index: playback.subtitle_stream_index,
+            preferences: self.playback_preferences(),
+        };
+
+        self.stop_current(false).await;
+        self.start_current(options).await?;
+        info!(bitrate, "已重新建立播放流以应用最大码率");
+        Ok(())
+    }
+
+    fn playback_preferences(&self) -> PlaybackPreferences {
+        self.playback
+            .as_ref()
+            .map(|playback| PlaybackPreferences {
+                paused: playback.paused,
+                muted: playback.muted,
+                volume: playback.volume,
+                playback_rate: playback.playback_rate,
+            })
+            .unwrap_or_default()
     }
 
     async fn set_subtitle(&mut self, index: Option<i32>) -> Result<()> {
@@ -487,11 +886,27 @@ impl Player {
 
         match event {
             MpvEvent::FileLoaded { .. } => {
-                let playback = self.playback.as_mut().expect("已核对播放 ID");
-                if !playback.started {
-                    playback.started = true;
-                    self.client.report_start(&playback.report()).await?;
-                    info!(item = %playback.item_name, "播放已开始并上报 Jellyfin");
+                let should_report = self
+                    .playback
+                    .as_ref()
+                    .is_some_and(|playback| !playback.started);
+                if should_report {
+                    let report = {
+                        let playback = self.playback.as_mut().expect("已核对播放 ID");
+                        playback.started = true;
+                        let queue = self
+                            .queue
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("播放已加载但当前没有播放队列"))?;
+                        playback.report(queue, self.repeat_mode, self.playback_order)
+                    };
+                    self.client.report_start(&report).await?;
+                    let item_name = self
+                        .playback
+                        .as_ref()
+                        .map(|playback| playback.item_name.as_str())
+                        .unwrap_or("未知媒体");
+                    info!(item = item_name, "播放已开始并上报 Jellyfin");
                 }
                 self.refresh_mpv_headers().await;
             }
@@ -527,10 +942,40 @@ impl Player {
                 }
             }
             MpvEvent::Ended { failed, .. } | MpvEvent::Terminated { failed, .. } => {
-                self.stop_current(failed).await;
+                self.handle_playback_end(failed).await?;
             }
         }
         Ok(())
+    }
+
+    async fn handle_playback_end(&mut self, failed: bool) -> Result<()> {
+        if failed {
+            self.queue = None;
+            self.stop_current(true).await;
+            return Ok(());
+        }
+
+        let next = self
+            .queue
+            .as_ref()
+            .and_then(|queue| queue.next_index(self.repeat_mode));
+        let Some(next) = next else {
+            self.queue = None;
+            self.stop_current(false).await;
+            return Ok(());
+        };
+
+        if let Some(queue) = self.queue.as_mut() {
+            queue.set_current(next);
+        }
+        let mut preferences = self.playback_preferences();
+        preferences.paused = false;
+        self.stop_current(false).await;
+        self.start_current(StartOptions {
+            preferences,
+            ..StartOptions::default()
+        })
+        .await
     }
 
     async fn handle_position(&mut self, seconds: f64) -> Result<()> {
@@ -571,10 +1016,14 @@ impl Player {
         let Some(playback) = &self.playback else {
             return;
         };
+        let Some(queue) = &self.queue else {
+            return;
+        };
         if !playback.started {
             return;
         }
-        if let Err(error) = self.client.report_progress(&playback.report()).await {
+        let report = playback.report(queue, self.repeat_mode, self.playback_order);
+        if let Err(error) = self.client.report_progress(&report).await {
             warn!(%error, "上报 Jellyfin 播放进度失败");
             return;
         }
@@ -610,7 +1059,13 @@ impl Player {
         }
         let _ = playback.mpv.quit().await;
         if playback.started {
-            if let Err(error) = self.client.report_stop(&playback.stop_report(failed)).await {
+            let queue = self
+                .queue
+                .as_ref()
+                .map(|queue| queue.items.as_slice())
+                .unwrap_or(&[]);
+            let report = playback.stop_report(failed, queue);
+            if let Err(error) = self.client.report_stop(&report).await {
                 warn!(%error, "上报 Jellyfin 停止播放失败");
             } else {
                 info!(item = %playback.item_name, "停止播放已上报 Jellyfin");
@@ -756,6 +1211,56 @@ mod tests {
             next_skip_target(&mut segments, 150, &settings),
             Some(("Recap".to_owned(), 200))
         );
+    }
+
+    #[test]
+    fn queue_advances_and_repeats_in_order() {
+        let mut queue = PlaybackQueue::new(
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            1,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(queue.current().map(|item| item.id.as_str()), Some("b"));
+        assert_eq!(queue.next_index(RepeatMode::RepeatNone), Some(2));
+        assert_eq!(queue.previous_index(RepeatMode::RepeatNone), Some(0));
+        queue.set_current(2);
+        assert_eq!(queue.next_index(RepeatMode::RepeatNone), None);
+        assert_eq!(queue.next_index(RepeatMode::RepeatOne), Some(2));
+        assert_eq!(queue.next_index(RepeatMode::RepeatAll), Some(0));
+    }
+
+    #[test]
+    fn queue_inserts_next_and_restores_sorted_order() {
+        let mut queue = PlaybackQueue::new(
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            1,
+            false,
+        )
+        .unwrap();
+        queue.insert_next(vec!["x".to_owned(), "y".to_owned()]);
+        assert_eq!(
+            queue
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "x", "y", "c"]
+        );
+
+        queue.set_order(PlaybackOrder::Shuffle);
+        assert_eq!(queue.current().map(|item| item.id.as_str()), Some("b"));
+        queue.set_order(PlaybackOrder::Default);
+        assert_eq!(
+            queue
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c", "x", "y"]
+        );
+        assert_eq!(queue.current().map(|item| item.id.as_str()), Some("b"));
     }
 
     fn media_segment(kind: &str, start_ticks: i64, end_ticks: i64) -> MediaSegment {

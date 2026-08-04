@@ -10,6 +10,8 @@ pub enum RemoteCommand {
     Resume,
     TogglePause,
     Stop,
+    NextTrack,
+    PreviousTrack,
     Seek(i64),
     SetVolume(f64),
     VolumeUp,
@@ -20,6 +22,9 @@ pub enum RemoteCommand {
     ToggleMute,
     SetAudio(Option<i32>),
     SetSubtitle(Option<i32>),
+    SetRepeatMode(RepeatMode),
+    SetShuffleMode(PlaybackOrder),
+    SetMaxStreamingBitrate(u64),
 }
 
 impl RemoteCommand {
@@ -30,6 +35,8 @@ impl RemoteCommand {
             Self::Resume => "Resume",
             Self::TogglePause => "TogglePause",
             Self::Stop => "Stop",
+            Self::NextTrack => "NextTrack",
+            Self::PreviousTrack => "PreviousTrack",
             Self::Seek(_) => "Seek",
             Self::SetVolume(_) => "SetVolume",
             Self::VolumeUp => "VolumeUp",
@@ -40,8 +47,48 @@ impl RemoteCommand {
             Self::ToggleMute => "ToggleMute",
             Self::SetAudio(_) => "SetAudio",
             Self::SetSubtitle(_) => "SetSubtitle",
+            Self::SetRepeatMode(_) => "SetRepeatMode",
+            Self::SetShuffleMode(_) => "SetShuffleQueue",
+            Self::SetMaxStreamingBitrate(_) => "SetMaxStreamingBitrate",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(clippy::enum_variant_names)]
+pub enum PlayCommand {
+    #[default]
+    PlayNow,
+    PlayNext,
+    PlayLast,
+    PlayInstantMix,
+    PlayShuffle,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(clippy::enum_variant_names)]
+pub enum RepeatMode {
+    #[default]
+    RepeatNone,
+    RepeatAll,
+    RepeatOne,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum PlaybackOrder {
+    #[default]
+    Default,
+    Shuffle,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlaybackQueueItem {
+    pub id: String,
+    pub playlist_item_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +96,8 @@ impl RemoteCommand {
 pub struct PlayRequest {
     #[serde(default)]
     pub item_ids: Vec<String>,
+    #[serde(default)]
+    pub play_command: PlayCommand,
     #[serde(default)]
     pub start_position_ticks: Option<i64>,
     #[serde(default)]
@@ -105,6 +154,42 @@ fn argument_i32(arguments: &HashMap<String, Value>, names: &[&str]) -> Option<i3
     })
 }
 
+fn argument_u64(arguments: &HashMap<String, Value>, names: &[&str]) -> Option<u64> {
+    names.iter().find_map(|name| {
+        arguments.get(*name).and_then(|value| match value {
+            Value::Number(value) => value.as_u64(),
+            Value::String(value) => value.parse().ok(),
+            _ => None,
+        })
+    })
+}
+
+fn argument_string<'a>(arguments: &'a HashMap<String, Value>, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| {
+        arguments.get(*name).and_then(|value| match value {
+            Value::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+    })
+}
+
+fn parse_repeat_mode(value: &str) -> Option<RepeatMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "repeatnone" | "none" => Some(RepeatMode::RepeatNone),
+        "repeatall" | "all" => Some(RepeatMode::RepeatAll),
+        "repeatone" | "one" => Some(RepeatMode::RepeatOne),
+        _ => None,
+    }
+}
+
+fn parse_playback_order(value: &str) -> Option<PlaybackOrder> {
+    match value.to_ascii_lowercase().as_str() {
+        "shuffle" => Some(PlaybackOrder::Shuffle),
+        "sorted" | "default" => Some(PlaybackOrder::Default),
+        _ => None,
+    }
+}
+
 pub enum SocketAction {
     Command(RemoteCommand),
     ForceKeepAlive(u64),
@@ -123,12 +208,14 @@ pub fn parse_socket_message(text: &str) -> Result<SocketAction, serde_json::Erro
         }
         "Playstate" => {
             let request: PlaystateRequest = serde_json::from_value(envelope.data)?;
-            let command = match request.command.as_str() {
-                "Pause" => Some(RemoteCommand::Pause),
-                "Unpause" => Some(RemoteCommand::Resume),
-                "PlayPause" => Some(RemoteCommand::TogglePause),
-                "Stop" => Some(RemoteCommand::Stop),
-                "Seek" => request.seek_position_ticks.map(RemoteCommand::Seek),
+            let command = match request.command.to_ascii_lowercase().as_str() {
+                "pause" => Some(RemoteCommand::Pause),
+                "unpause" => Some(RemoteCommand::Resume),
+                "playpause" => Some(RemoteCommand::TogglePause),
+                "stop" => Some(RemoteCommand::Stop),
+                "nexttrack" => Some(RemoteCommand::NextTrack),
+                "previoustrack" => Some(RemoteCommand::PreviousTrack),
+                "seek" => request.seek_position_ticks.map(RemoteCommand::Seek),
                 _ => None,
             };
             Ok(command.map_or_else(
@@ -154,6 +241,20 @@ pub fn parse_socket_message(text: &str) -> Result<SocketAction, serde_json::Erro
                 "Mute" => Some(RemoteCommand::Mute(true)),
                 "Unmute" => Some(RemoteCommand::Mute(false)),
                 "ToggleMute" => Some(RemoteCommand::ToggleMute),
+                "SetRepeatMode" => argument_string(&request.arguments, &["RepeatMode"])
+                    .and_then(parse_repeat_mode)
+                    .map(RemoteCommand::SetRepeatMode),
+                "SetShuffleQueue" | "SetPlaybackOrder" => {
+                    argument_string(&request.arguments, &["ShuffleMode", "PlaybackOrder"])
+                        .and_then(parse_playback_order)
+                        .map(RemoteCommand::SetShuffleMode)
+                }
+                "SetMaxStreamingBitrate" => argument_u64(
+                    &request.arguments,
+                    &["Bitrate", "MaxStreamingBitrate", "maxBitrate"],
+                )
+                .filter(|value| *value > 0)
+                .map(RemoteCommand::SetMaxStreamingBitrate),
                 "SetAudioStreamIndex" => {
                     argument_i32(&request.arguments, &["Index", "AudioStreamIndex", "index"])
                         .map(|index| RemoteCommand::SetAudio((index >= 0).then_some(index)))
@@ -286,6 +387,12 @@ pub struct PlaybackReport<'a> {
     pub audio_stream_index: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle_stream_index: Option<i32>,
+    pub repeat_mode: RepeatMode,
+    pub playback_order: PlaybackOrder,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now_playing_queue: Option<&'a [PlaybackQueueItem]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playlist_item_id: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,6 +405,10 @@ pub struct PlaybackStopReport<'a> {
     pub live_stream_id: Option<&'a str>,
     pub position_ticks: i64,
     pub failed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now_playing_queue: Option<&'a [PlaybackQueueItem]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playlist_item_id: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -313,6 +424,7 @@ mod tests {
             panic!("不是播放命令");
         };
         assert_eq!(request.item_ids, ["abc"]);
+        assert_eq!(request.play_command, PlayCommand::PlayNow);
         assert_eq!(request.start_position_ticks, Some(42));
 
         let seek =
@@ -340,6 +452,30 @@ mod tests {
                 std::mem::discriminant(&expected)
             );
         }
+    }
+
+    #[test]
+    fn parses_queue_commands() {
+        for (command, expected) in [
+            ("NextTrack", RemoteCommand::NextTrack),
+            ("PreviousTrack", RemoteCommand::PreviousTrack),
+        ] {
+            let message =
+                format!(r#"{{"MessageType":"Playstate","Data":{{"Command":"{command}"}}}}"#);
+            let SocketAction::Command(actual) = parse_socket_message(&message).unwrap() else {
+                panic!("未解析为队列播放状态命令");
+            };
+            assert_eq!(actual.name(), expected.name());
+        }
+
+        let play = r#"{"MessageType":"Play","Data":{"ItemIds":["a","b"],"PlayCommand":"PlayLast","StartIndex":1}}"#;
+        let SocketAction::Command(RemoteCommand::Play(request)) =
+            parse_socket_message(play).unwrap()
+        else {
+            panic!("未解析为带队列的播放命令");
+        };
+        assert_eq!(request.play_command, PlayCommand::PlayLast);
+        assert_eq!(request.start_index, Some(1));
     }
 
     #[test]
@@ -419,6 +555,27 @@ mod tests {
         assert!(matches!(
             parse_socket_message(disable).unwrap(),
             SocketAction::Command(RemoteCommand::SetAudio(None))
+        ));
+    }
+
+    #[test]
+    fn parses_queue_modes_and_max_bitrate() {
+        let repeat = r#"{"MessageType":"GeneralCommand","Data":{"Name":"SetRepeatMode","Arguments":{"RepeatMode":"RepeatAll"}}}"#;
+        assert!(matches!(
+            parse_socket_message(repeat).unwrap(),
+            SocketAction::Command(RemoteCommand::SetRepeatMode(RepeatMode::RepeatAll))
+        ));
+
+        let shuffle = r#"{"MessageType":"GeneralCommand","Data":{"Name":"SetShuffleQueue","Arguments":{"ShuffleMode":"Shuffle"}}}"#;
+        assert!(matches!(
+            parse_socket_message(shuffle).unwrap(),
+            SocketAction::Command(RemoteCommand::SetShuffleMode(PlaybackOrder::Shuffle))
+        ));
+
+        let bitrate = r#"{"MessageType":"GeneralCommand","Data":{"Name":"SetMaxStreamingBitrate","Arguments":{"Bitrate":8000000}}}"#;
+        assert!(matches!(
+            parse_socket_message(bitrate).unwrap(),
+            SocketAction::Command(RemoteCommand::SetMaxStreamingBitrate(8_000_000))
         ));
     }
 }

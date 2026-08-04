@@ -9,6 +9,7 @@
 - 连接 Jellyfin WebSocket，并自动重连、响应 KeepAlive；
 - Access Token 被服务端注销或失效后，自动用用户名和密码重新登录并重试请求；
 - 接收播放、暂停、继续、停止、跳转、设置音量、音量增减、静音/取消静音、播放中切换音轨、全屏切换和倍速；
+- 支持多条目播放队列、自动连播、上一首/下一首、循环和随机播放；播放中可重新请求 PlaybackInfo 以切换最大流媒体码率，并尽量保持当前位置、暂停状态、音量、静音和倍速；
 - 加载 Jellyfin 选中的外部或文本型内嵌字幕，并支持播放中远程切换/关闭字幕；
 - 读取 Jellyfin 原生 `MediaSegments`，按设置自动跳过片头、片尾、前情回顾、预告或广告；
 - 在 mpv 进度条悬停时显示 Jellyfin Trickplay 缩略图，兼容新版内置 OSC 和 uosc/thumbfast 协议；
@@ -154,4 +155,4 @@ Jellyfin WebSocket 命令
    外部 mpv JSON IPC ─── 播放结束 ────▶ Jellyfin HTTP 停止上报
 ```
 
-第一版有意不处理播放队列、上一首/下一首、多服务器、发现服务器和本地媒体库界面。`PlayTrailers` 需要额外处理远程 URL 和多条目队列，`SetMaxStreamingBitrate` 需要重建转码会话，因此当前不会向 Jellyfin 声明这两项能力。PGS 等图片型内嵌字幕仍由原始媒体或 Jellyfin 转码流处理，不单独提取加载。
+当前仍不处理 `PlayTrailers`、多服务器、发现服务器和本地媒体库界面。`PlayTrailers` 需要额外处理远程 URL 和预告片队列；PGS 等图片型内嵌字幕仍由原始媒体或 Jellyfin 转码流处理，不单独提取加载。

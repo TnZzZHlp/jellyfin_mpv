@@ -38,6 +38,7 @@ use crate::{
 const CLIENT_NAME: &str = "Jellyfin MPV Cast";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_TRICKPLAY_TILE_BYTES: u64 = 32 * 1024 * 1024;
+const DEFAULT_MAX_STREAMING_BITRATE: u64 = i32::MAX as u64;
 
 pub struct JellyfinClient {
     config: Config,
@@ -52,7 +53,8 @@ fn session_capabilities() -> Value {
             "PlayMediaSource",
             "SetVolume", "VolumeUp", "VolumeDown", "ToggleFullscreen",
             "Mute", "Unmute", "ToggleMute",
-            "SetAudioStreamIndex", "SetSubtitleStreamIndex", "PlaybackRate"
+            "SetAudioStreamIndex", "SetSubtitleStreamIndex", "PlaybackRate",
+            "SetRepeatMode", "SetShuffleQueue", "SetMaxStreamingBitrate"
         ],
         "SupportsMediaControl": true,
         "SupportsPersistentIdentifier": true
@@ -239,6 +241,7 @@ impl JellyfinClient {
         Ok(result.items)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn playback_info(
         &self,
         user_id: &str,
@@ -247,6 +250,7 @@ impl JellyfinClient {
         media_source_id: Option<&str>,
         audio_index: Option<i32>,
         subtitle_index: Option<i32>,
+        max_streaming_bitrate: Option<u64>,
     ) -> Result<PlaybackInfoResponse> {
         let mut url = self.endpoint(&["Items", item_id, "PlaybackInfo"])?;
         {
@@ -266,6 +270,9 @@ impl JellyfinClient {
             if let Some(index) = subtitle_index {
                 query.append_pair("subtitleStreamIndex", &index.to_string());
             }
+            if let Some(bitrate) = max_streaming_bitrate {
+                query.append_pair("maxStreamingBitrate", &bitrate.to_string());
+            }
         }
 
         let response = self
@@ -277,6 +284,7 @@ impl JellyfinClient {
                     media_source_id,
                     audio_index,
                     subtitle_index,
+                    max_streaming_bitrate,
                 ),
             )
             .await
@@ -691,7 +699,12 @@ fn playback_profile(
     media_source_id: Option<&str>,
     audio_index: Option<i32>,
     subtitle_index: Option<i32>,
+    max_streaming_bitrate: Option<u64>,
 ) -> Value {
+    let max_bitrate = max_streaming_bitrate
+        .unwrap_or(DEFAULT_MAX_STREAMING_BITRATE)
+        .min(i32::MAX as u64) as i32;
+
     json!({
         "UserId": user_id,
         "StartTimeTicks": start_ticks,
@@ -706,8 +719,8 @@ fn playback_profile(
         "AutoOpenLiveStream": true,
         "DeviceProfile": {
             "Name": "mpv",
-            "MaxStreamingBitrate": 2_147_483_647_i64,
-            "MaxStaticBitrate": 2_147_483_647_i64,
+            "MaxStreamingBitrate": max_bitrate,
+            "MaxStaticBitrate": max_bitrate,
             "DirectPlayProfiles": [
                 {
                     "Type": "Video",
@@ -767,6 +780,79 @@ mod tests {
                 .iter()
                 .any(|command| command.as_str() == Some("PlayMediaSource"))
         );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.as_str() == Some("SetMaxStreamingBitrate"))
+        );
+    }
+
+    #[test]
+    fn playback_profile_uses_requested_max_streaming_bitrate() {
+        let profile = playback_profile("user", 0, None, None, None, Some(8_000_000));
+        assert_eq!(profile["DeviceProfile"]["MaxStreamingBitrate"], 8_000_000);
+        assert_eq!(profile["DeviceProfile"]["MaxStaticBitrate"], 8_000_000);
+    }
+
+    #[tokio::test]
+    async fn requests_playback_info_with_max_streaming_bitrate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let responses = [
+                (
+                    200,
+                    r#"{"AccessToken":"token","User":{"Id":"user-1","Name":"Alice"}}"#,
+                ),
+                (
+                    200,
+                    r#"{"MediaSources":[{"Id":"source-1","SupportsDirectPlay":true}],"PlaySessionId":"session-1"}"#,
+                ),
+            ];
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut stream).await);
+                write_response(&mut stream, status, body).await;
+            }
+            requests
+        });
+
+        let encoded = STANDARD.encode("password");
+        let config = ConfigArgs::try_parse_from([
+            "jellyfin-mpv",
+            "--server",
+            &format!("http://{address}"),
+            "--username",
+            "Alice",
+            "--password",
+            &encoded,
+            "--device-id",
+            "test-device",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap()
+        .unwrap();
+        let (client, _) = JellyfinClient::connect(config).await.unwrap();
+        client
+            .playback_info(
+                "user-1",
+                "item-1",
+                123,
+                Some("source-1"),
+                Some(2),
+                Some(3),
+                Some(8_000_000),
+            )
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert!(requests[1].starts_with(
+            "POST /Items/item-1/PlaybackInfo?userId=user-1&startTimeTicks=123&autoOpenLiveStream=true&enableDirectPlay=true&enableDirectStream=true&enableTranscoding=true&mediaSourceId=source-1&audioStreamIndex=2&subtitleStreamIndex=3&maxStreamingBitrate=8000000 "
+        ));
+        assert!(requests[1].contains("\"MaxStreamingBitrate\":8000000"));
     }
 
     #[test]
