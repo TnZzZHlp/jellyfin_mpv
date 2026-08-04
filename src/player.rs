@@ -9,8 +9,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    jellyfin::JellyfinClient,
-    mpv::{MpvEvent, MpvHandle, MpvLaunch, spawn_mpv},
+    jellyfin::{JellyfinClient, PlaybackConstraints},
+    mpv::{MpvEvent, MpvHandle, MpvLaunch, MpvQualitySelection, spawn_mpv},
     protocol::{
         MediaSegment, MediaStream, PlayCommand, PlayRequest, PlaybackOrder, PlaybackQueueItem,
         PlaybackReport, PlaybackStopReport, RemoteCommand, RepeatMode,
@@ -32,7 +32,7 @@ pub struct Player {
     queue: Option<PlaybackQueue>,
     repeat_mode: RepeatMode,
     playback_order: PlaybackOrder,
-    max_streaming_bitrate: Option<u64>,
+    playback_constraints: PlaybackConstraints,
 }
 
 struct Playback {
@@ -56,7 +56,7 @@ struct Playback {
     muted: bool,
     volume: f64,
     playback_rate: f64,
-    max_streaming_bitrate: Option<u64>,
+    playback_constraints: PlaybackConstraints,
     started: bool,
     skip_segments: Vec<SkipSegment>,
 }
@@ -305,7 +305,11 @@ impl Player {
             queue: None,
             repeat_mode: RepeatMode::RepeatNone,
             playback_order: PlaybackOrder::Default,
-            max_streaming_bitrate: None,
+            playback_constraints: PlaybackConstraints {
+                max_streaming_bitrate: None,
+                max_width: None,
+                max_height: None,
+            },
         }
     }
 
@@ -540,7 +544,7 @@ impl Player {
                 options.media_source_id.as_deref(),
                 options.audio_stream_index,
                 options.subtitle_stream_index,
-                self.max_streaming_bitrate,
+                self.playback_constraints,
             )
             .await?;
         let skip_segments =
@@ -623,6 +627,7 @@ impl Player {
             start_seconds: start_ticks as f64 / 10_000_000.0,
             subtitle_url,
             thumbnail_size: trickplay.as_ref().map(|profile| profile.display_size()),
+            quality_selection: quality_selection_for(self.playback_constraints),
             events: self.mpv_events.clone(),
         })
         .await
@@ -666,7 +671,7 @@ impl Player {
             muted: options.preferences.muted,
             volume: options.preferences.volume,
             playback_rate: options.preferences.playback_rate,
-            max_streaming_bitrate: self.max_streaming_bitrate,
+            playback_constraints: self.playback_constraints,
             started: false,
             skip_segments,
         });
@@ -738,19 +743,43 @@ impl Player {
     }
 
     async fn set_max_streaming_bitrate(&mut self, bitrate: u64) -> Result<()> {
-        let bitrate = bitrate.min(i32::MAX as u64);
-        if self.max_streaming_bitrate == Some(bitrate)
+        let mut constraints = self.playback_constraints;
+        constraints.max_streaming_bitrate = Some(bitrate.min(i32::MAX as u64));
+        self.set_playback_constraints(constraints).await
+    }
+
+    async fn set_quality(&mut self, selection: MpvQualitySelection) -> Result<()> {
+        let constraints = match selection {
+            MpvQualitySelection::Auto => PlaybackConstraints::default(),
+            MpvQualitySelection::Bitrate(bitrate) => PlaybackConstraints::bitrate(bitrate),
+            MpvQualitySelection::Resolution { width, height } => {
+                PlaybackConstraints::resolution(width, height)
+            }
+        };
+        self.set_playback_constraints(constraints).await?;
+        info!(quality = %selection.label(), "已从 MPV 质量菜单选择播放质量");
+        Ok(())
+    }
+
+    async fn set_playback_constraints(
+        &mut self,
+        mut constraints: PlaybackConstraints,
+    ) -> Result<()> {
+        constraints.max_streaming_bitrate = constraints
+            .max_streaming_bitrate
+            .map(|bitrate| bitrate.clamp(1, i32::MAX as u64));
+        if self.playback_constraints == constraints
             && self
                 .playback
                 .as_ref()
-                .is_some_and(|playback| playback.max_streaming_bitrate == Some(bitrate))
+                .is_some_and(|playback| playback.playback_constraints == constraints)
         {
             return Ok(());
         }
 
-        self.max_streaming_bitrate = Some(bitrate);
+        self.playback_constraints = constraints;
         let Some(playback) = self.playback.as_ref() else {
-            info!(bitrate, "已保存下次播放使用的最大码率");
+            info!(?constraints, "已保存下次播放使用的质量限制");
             return Ok(());
         };
         let options = StartOptions {
@@ -763,7 +792,7 @@ impl Player {
 
         self.stop_current(false).await;
         self.start_current(options).await?;
-        info!(bitrate, "已重新建立播放流以应用最大码率");
+        info!(?constraints, "已重新建立播放流以应用质量限制");
         Ok(())
     }
 
@@ -877,6 +906,7 @@ impl Player {
             | MpvEvent::Volume { id, .. }
             | MpvEvent::AudioTracks { id, .. }
             | MpvEvent::Preview { id, .. }
+            | MpvEvent::Quality { id, .. }
             | MpvEvent::Ended { id, .. }
             | MpvEvent::Terminated { id, .. } => *id,
         };
@@ -940,6 +970,9 @@ impl Player {
                 {
                     thumbnail.request(request);
                 }
+            }
+            MpvEvent::Quality { selection, .. } => {
+                self.set_quality(selection).await?;
             }
             MpvEvent::Ended { failed, .. } | MpvEvent::Terminated { failed, .. } => {
                 self.handle_playback_end(failed).await?;
@@ -1085,6 +1118,16 @@ impl Player {
     }
 }
 
+fn quality_selection_for(constraints: PlaybackConstraints) -> MpvQualitySelection {
+    match (constraints.max_width, constraints.max_height) {
+        (Some(width), Some(height)) => MpvQualitySelection::Resolution { width, height },
+        _ => constraints
+            .max_streaming_bitrate
+            .map(MpvQualitySelection::Bitrate)
+            .unwrap_or(MpvQualitySelection::Auto),
+    }
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -1153,6 +1196,25 @@ fn mark_passed_skip_segments(segments: &mut [SkipSegment], position_ticks: i64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derives_mpv_quality_menu_state_from_playback_constraints() {
+        assert_eq!(
+            quality_selection_for(PlaybackConstraints::default()),
+            MpvQualitySelection::Auto
+        );
+        assert_eq!(
+            quality_selection_for(PlaybackConstraints::bitrate(8_000_000)),
+            MpvQualitySelection::Bitrate(8_000_000)
+        );
+        assert_eq!(
+            quality_selection_for(PlaybackConstraints::resolution(1_280, 720)),
+            MpvQualitySelection::Resolution {
+                width: 1_280,
+                height: 720,
+            }
+        );
+    }
 
     #[test]
     fn prepares_and_skips_intro_and_outro_once() {

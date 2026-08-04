@@ -185,6 +185,10 @@ pub enum MpvEvent {
         id: Uuid,
         request: Option<MpvPreviewRequest>,
     },
+    Quality {
+        id: Uuid,
+        selection: MpvQualitySelection,
+    },
     Ended {
         id: Uuid,
         failed: bool,
@@ -193,6 +197,38 @@ pub enum MpvEvent {
         id: Uuid,
         failed: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MpvQualitySelection {
+    #[default]
+    Auto,
+    Bitrate(u64),
+    Resolution {
+        width: u32,
+        height: u32,
+    },
+}
+
+impl MpvQualitySelection {
+    pub fn menu_token(self) -> String {
+        match self {
+            Self::Auto => "auto".to_owned(),
+            Self::Bitrate(bitrate) => format!("bitrate-{bitrate}"),
+            Self::Resolution { width, height } => format!("resolution-{width}x{height}"),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Auto => "自动（不限制）".to_owned(),
+            Self::Bitrate(bitrate) => {
+                let megabits = bitrate as f64 / 1_000_000.0;
+                format!("码率上限：{megabits:.1} Mbps")
+            }
+            Self::Resolution { height, .. } => format!("分辨率上限：{height}p"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -324,6 +360,7 @@ pub struct MpvLaunch {
     pub start_seconds: f64,
     pub subtitle_url: Option<Url>,
     pub thumbnail_size: Option<(u32, u32)>,
+    pub quality_selection: MpvQualitySelection,
     pub events: mpsc::Sender<MpvEvent>,
 }
 
@@ -339,26 +376,39 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
         start_seconds,
         subtitle_url,
         mut thumbnail_size,
+        quality_selection,
         events,
     } = launch;
     let id = Uuid::new_v4();
     let ipc_path = ipc_path(id);
     let window_state = effective_window_state(playback_mode, &extra_args);
-    let thumbnail_script_directory = if thumbnail_size.is_some() {
-        match prepare_thumbnail_script(id).await {
-            Ok(directory) => Some(directory),
-            Err(error) => {
+    let script_directory = match prepare_script_directory(id).await {
+        Ok(directory) => {
+            if thumbnail_size.is_some()
+                && let Err(error) = prepare_thumbnail_script(&directory).await
+            {
                 warn!(%error, "无法准备 mpv 缩略图桥接脚本，继续普通播放");
                 thumbnail_size = None;
-                None
             }
+            Some(directory)
         }
-    } else {
-        None
+        Err(error) => {
+            warn!(%error, "无法准备 mpv 质量菜单脚本，继续普通播放");
+            thumbnail_size = None;
+            None
+        }
     };
     let mut command = Command::new(&executable);
     command.args(window_args(window_state, &extra_args));
-    if let Some(directory) = thumbnail_script_directory.as_ref() {
+    if let Some(directory) = script_directory.as_ref() {
+        command.arg(format!(
+            "--script={}",
+            directory.join("quality_menu.lua").to_string_lossy()
+        ));
+    }
+    if thumbnail_size.is_some()
+        && let Some(directory) = script_directory.as_ref()
+    {
         command.arg(format!(
             "--script={}",
             directory.join("thumbfast.lua").to_string_lossy()
@@ -378,7 +428,7 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            cleanup_thumbnail_script_directory(thumbnail_script_directory.as_deref()).await;
+            cleanup_script_directory(script_directory.as_deref()).await;
             return Err(error).with_context(|| format!("无法启动 mpv: {}", executable.display()));
         }
     };
@@ -399,6 +449,7 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
             start_seconds,
             subtitle_url,
             thumbnail_size,
+            quality_selection,
             command_rx,
             events.clone(),
             &mut startup_tx,
@@ -414,7 +465,7 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
             }
         }
         cleanup_ipc(&ipc_path).await;
-        cleanup_thumbnail_script_directory(thumbnail_script_directory.as_deref()).await;
+        cleanup_script_directory(script_directory.as_deref()).await;
     });
 
     match timeout(Duration::from_secs(15), startup_rx).await {
@@ -501,6 +552,7 @@ async fn run_actor(
     start_seconds: f64,
     subtitle_url: Option<Url>,
     thumbnail_size: Option<(u32, u32)>,
+    quality_selection: MpvQualitySelection,
     mut commands: mpsc::Receiver<MpvCommand>,
     events: mpsc::Sender<MpvEvent>,
     startup: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
@@ -595,6 +647,7 @@ async fn run_actor(
                             if let Some((width, height)) = thumbnail_size {
                                 configure_thumbnail_script(&mut writer, width, height).await?;
                             }
+                            configure_quality_menu(&mut writer, quality_selection).await?;
                             let _ = events.send(MpvEvent::FileLoaded { id }).await;
                         } else if value.get("event").and_then(Value::as_str) == Some("property-change") {
                             emit_property(id, &value, &events).await;
@@ -688,6 +741,22 @@ async fn configure_thumbnail_script<W: AsyncWrite + Unpin>(
             "jellyfin-mpv-thumbnail-info",
             width.to_string(),
             height.to_string()
+        ]}),
+    )
+    .await
+}
+
+async fn configure_quality_menu<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    selection: MpvQualitySelection,
+) -> Result<()> {
+    send_json(
+        writer,
+        json!({"command": [
+            "script-message",
+            "jellyfin-mpv-quality-selected",
+            selection.menu_token(),
+            selection.label()
         ]}),
     )
     .await
@@ -841,8 +910,31 @@ async fn emit_client_message(id: Uuid, value: &Value, events: &mpsc::Sender<MpvE
         Some("jellyfin-mpv-preview-clear") => {
             let _ = events.send(MpvEvent::Preview { id, request: None }).await;
         }
+        Some("jellyfin-mpv-quality") if arguments.len() >= 2 => {
+            let Some(selection) = arguments[1].as_str().and_then(parse_quality_selection) else {
+                return;
+            };
+            let _ = events.send(MpvEvent::Quality { id, selection }).await;
+        }
         _ => {}
     }
+}
+
+fn parse_quality_selection(value: &str) -> Option<MpvQualitySelection> {
+    if value == "auto" {
+        return Some(MpvQualitySelection::Auto);
+    }
+    if let Some(bitrate) = value.strip_prefix("bitrate-") {
+        let bitrate = bitrate.parse::<u64>().ok()?;
+        return (bitrate > 0 && bitrate <= i32::MAX as u64)
+            .then_some(MpvQualitySelection::Bitrate(bitrate));
+    }
+    let resolution = value.strip_prefix("resolution-")?;
+    let (width, height) = resolution.split_once('x')?;
+    let width = width.parse::<u32>().ok()?;
+    let height = height.parse::<u32>().ok()?;
+    (width > 0 && height > 0 && width <= 16_384 && height <= 16_384)
+        .then_some(MpvQualitySelection::Resolution { width, height })
 }
 
 fn value_as_f64(value: &Value) -> Option<f64> {
@@ -852,31 +944,40 @@ fn value_as_f64(value: &Value) -> Option<f64> {
         .filter(|number| number.is_finite())
 }
 
-async fn prepare_thumbnail_script(id: Uuid) -> Result<PathBuf> {
+async fn prepare_script_directory(id: Uuid) -> Result<PathBuf> {
     let directory = std::env::temp_dir().join(format!("jellyfin-mpv-script-{id}"));
     tokio::fs::create_dir(&directory)
         .await
         .with_context(|| format!("创建 mpv 脚本临时目录失败: {}", directory.display()))?;
     if let Err(error) = tokio::fs::write(
-        directory.join("thumbfast.lua"),
-        include_bytes!("thumbfast.lua"),
+        directory.join("quality_menu.lua"),
+        include_bytes!("quality_menu.lua"),
     )
     .await
     {
         let _ = tokio::fs::remove_dir_all(&directory).await;
-        return Err(error).context("写入 mpv 缩略图桥接脚本失败");
+        return Err(error).context("写入 mpv 质量菜单脚本失败");
     }
     Ok(directory)
 }
 
-async fn cleanup_thumbnail_script_directory(directory: Option<&Path>) {
+async fn prepare_thumbnail_script(directory: &Path) -> Result<()> {
+    tokio::fs::write(
+        directory.join("thumbfast.lua"),
+        include_bytes!("thumbfast.lua"),
+    )
+    .await
+    .context("写入 mpv 缩略图桥接脚本失败")
+}
+
+async fn cleanup_script_directory(directory: Option<&Path>) {
     let Some(directory) = directory else {
         return;
     };
     if let Err(error) = tokio::fs::remove_dir_all(directory).await
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        debug!(%error, path = %directory.display(), "清理 mpv 缩略图桥接脚本失败");
+        debug!(%error, path = %directory.display(), "清理 mpv 脚本临时目录失败");
     }
 }
 
@@ -1216,6 +1317,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parses_quality_menu_client_messages() {
+        let (events, mut receiver) = mpsc::channel(1);
+        let id = Uuid::new_v4();
+        emit_client_message(
+            id,
+            &json!({
+                "event": "client-message",
+                "args": ["jellyfin-mpv-quality", "resolution-1920x1080"]
+            }),
+            &events,
+        )
+        .await;
+
+        let MpvEvent::Quality {
+            id: event_id,
+            selection,
+        } = receiver.recv().await.expect("应产生质量选择事件")
+        else {
+            panic!("事件类型错误");
+        };
+        assert_eq!(event_id, id);
+        assert_eq!(
+            selection,
+            MpvQualitySelection::Resolution {
+                width: 1_920,
+                height: 1_080,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn completes_overlay_command_from_mpv_response() {
         let (completed, result) = oneshot::channel();
         let mut pending = HashMap::from([(42, completed)]);
@@ -1248,5 +1380,40 @@ mod tests {
                 "180"
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn configures_quality_menu_with_current_selection() {
+        let (mut writer, mut reader) = duplex(1024);
+        configure_quality_menu(
+            &mut writer,
+            MpvQualitySelection::Resolution {
+                width: 1_920,
+                height: 1_080,
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let message: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(
+            message["command"],
+            json!([
+                "script-message",
+                "jellyfin-mpv-quality-selected",
+                "resolution-1920x1080",
+                "分辨率上限：1080p"
+            ])
+        );
+    }
+
+    #[test]
+    fn embedded_quality_menu_uses_f9() {
+        let script = std::str::from_utf8(include_bytes!("quality_menu.lua")).unwrap();
+        assert!(script.contains("\"F9\""));
+        assert!(script.contains("jellyfin-mpv-quality"));
     }
 }

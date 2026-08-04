@@ -39,6 +39,53 @@ const CLIENT_NAME: &str = "Jellyfin MPV Cast";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_TRICKPLAY_TILE_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_MAX_STREAMING_BITRATE: u64 = i32::MAX as u64;
+const VIDEO_CONTAINERS: &str =
+    "avi,mkv,mov,mp4,m4v,webm,ts,mpegts,m2ts,mpg,mpeg,wmv,asf,flv,ogv,3gp";
+const VIDEO_CODECS: &str = "h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1,vc1,theora";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlaybackConstraints {
+    pub max_streaming_bitrate: Option<u64>,
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
+}
+
+impl PlaybackConstraints {
+    pub const fn bitrate(max_streaming_bitrate: u64) -> Self {
+        Self {
+            max_streaming_bitrate: Some(max_streaming_bitrate),
+            max_width: None,
+            max_height: None,
+        }
+    }
+
+    pub const fn resolution(max_width: u32, max_height: u32) -> Self {
+        Self {
+            max_streaming_bitrate: None,
+            max_width: Some(max_width),
+            max_height: Some(max_height),
+        }
+    }
+
+    fn resolution_conditions(self) -> Vec<Value> {
+        let mut conditions = Vec::new();
+        if let Some(width) = self.max_width.filter(|width| *width > 0) {
+            conditions.push(json!({
+                "Condition": "LessThanEqual",
+                "Property": "Width",
+                "Value": width.to_string()
+            }));
+        }
+        if let Some(height) = self.max_height.filter(|height| *height > 0) {
+            conditions.push(json!({
+                "Condition": "LessThanEqual",
+                "Property": "Height",
+                "Value": height.to_string()
+            }));
+        }
+        conditions
+    }
+}
 
 pub struct JellyfinClient {
     config: Config,
@@ -252,7 +299,7 @@ impl JellyfinClient {
         media_source_id: Option<&str>,
         audio_index: Option<i32>,
         subtitle_index: Option<i32>,
-        max_streaming_bitrate: Option<u64>,
+        constraints: PlaybackConstraints,
     ) -> Result<PlaybackInfoResponse> {
         let mut url = self.endpoint(&["Items", item_id, "PlaybackInfo"])?;
         {
@@ -272,7 +319,7 @@ impl JellyfinClient {
             if let Some(index) = subtitle_index {
                 query.append_pair("subtitleStreamIndex", &index.to_string());
             }
-            if let Some(bitrate) = max_streaming_bitrate {
+            if let Some(bitrate) = constraints.max_streaming_bitrate {
                 query.append_pair("maxStreamingBitrate", &bitrate.to_string());
             }
         }
@@ -286,7 +333,7 @@ impl JellyfinClient {
                     media_source_id,
                     audio_index,
                     subtitle_index,
-                    max_streaming_bitrate,
+                    constraints,
                 ),
             )
             .await
@@ -701,11 +748,23 @@ fn playback_profile(
     media_source_id: Option<&str>,
     audio_index: Option<i32>,
     subtitle_index: Option<i32>,
-    max_streaming_bitrate: Option<u64>,
+    constraints: PlaybackConstraints,
 ) -> Value {
-    let max_bitrate = max_streaming_bitrate
+    let max_bitrate = constraints
+        .max_streaming_bitrate
         .unwrap_or(DEFAULT_MAX_STREAMING_BITRATE)
         .min(i32::MAX as u64) as i32;
+    let resolution_conditions = constraints.resolution_conditions();
+    let codec_profiles = if resolution_conditions.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({
+            "Type": "Video",
+            "Container": VIDEO_CONTAINERS,
+            "Codec": VIDEO_CODECS,
+            "Conditions": resolution_conditions
+        })]
+    };
 
     json!({
         "UserId": user_id,
@@ -726,8 +785,8 @@ fn playback_profile(
             "DirectPlayProfiles": [
                 {
                     "Type": "Video",
-                    "Container": "avi,mkv,mov,mp4,m4v,webm,ts,mpegts,m2ts,mpg,mpeg,wmv,asf,flv,ogv,3gp",
-                    "VideoCodec": "h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1,vc1,theora",
+                    "Container": VIDEO_CONTAINERS,
+                    "VideoCodec": VIDEO_CODECS,
                     "AudioCodec": "aac,ac3,eac3,dts,truehd,mp3,flac,opus,vorbis,pcm_s16le,pcm_s24le"
                 },
                 {
@@ -746,6 +805,7 @@ fn playback_profile(
                     "AudioCodec": "mp3", "Context": "Streaming"
                 }
             ],
+            "CodecProfiles": codec_profiles,
             "SubtitleProfiles": [
                 { "Format": "srt", "Method": "External" },
                 { "Format": "ass", "Method": "External" },
@@ -796,9 +856,51 @@ mod tests {
 
     #[test]
     fn playback_profile_uses_requested_max_streaming_bitrate() {
-        let profile = playback_profile("user", 0, None, None, None, Some(8_000_000));
+        let profile = playback_profile(
+            "user",
+            0,
+            None,
+            None,
+            None,
+            PlaybackConstraints::bitrate(8_000_000),
+        );
         assert_eq!(profile["DeviceProfile"]["MaxStreamingBitrate"], 8_000_000);
         assert_eq!(profile["DeviceProfile"]["MaxStaticBitrate"], 8_000_000);
+    }
+
+    #[test]
+    fn playback_profile_uses_requested_resolution_limit() {
+        let profile = playback_profile(
+            "user",
+            0,
+            None,
+            None,
+            None,
+            PlaybackConstraints::resolution(1_920, 1_080),
+        );
+        let conditions = profile["DeviceProfile"]["CodecProfiles"][0]["Conditions"]
+            .as_array()
+            .expect("应包含视频分辨率条件");
+        assert!(conditions.iter().any(|condition| {
+            condition
+                == &json!({
+                    "Condition": "LessThanEqual",
+                    "Property": "Width",
+                    "Value": "1920"
+                })
+        }));
+        assert!(conditions.iter().any(|condition| {
+            condition
+                == &json!({
+                    "Condition": "LessThanEqual",
+                    "Property": "Height",
+                    "Value": "1080"
+                })
+        }));
+        assert_eq!(
+            profile["DeviceProfile"]["CodecProfiles"][0]["Codec"],
+            VIDEO_CODECS
+        );
     }
 
     #[tokio::test]
@@ -850,7 +952,7 @@ mod tests {
                 Some("source-1"),
                 Some(2),
                 Some(3),
-                Some(8_000_000),
+                PlaybackConstraints::bitrate(8_000_000),
             )
             .await
             .unwrap();
