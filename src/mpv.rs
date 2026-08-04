@@ -177,6 +177,10 @@ pub enum MpvEvent {
         id: Uuid,
         volume: f64,
     },
+    AudioTracks {
+        id: Uuid,
+        audio_track_ids: HashMap<i32, i32>,
+    },
     Preview {
         id: Uuid,
         request: Option<MpvPreviewRequest>,
@@ -219,6 +223,9 @@ enum MpvCommand {
     Volume(f64),
     Mute(bool),
     ToggleMute,
+    ToggleFullscreen,
+    PlaybackRate(f64),
+    AudioTrack(Option<i32>),
     LoadSubtitle(String),
     DisableSubtitle,
     AddOverlay {
@@ -258,6 +265,18 @@ impl MpvHandle {
 
     pub async fn toggle_mute(&self) -> Result<()> {
         self.send(MpvCommand::ToggleMute).await
+    }
+
+    pub async fn toggle_fullscreen(&self) -> Result<()> {
+        self.send(MpvCommand::ToggleFullscreen).await
+    }
+
+    pub async fn set_playback_rate(&self, rate: f64) -> Result<()> {
+        self.send(MpvCommand::PlaybackRate(rate)).await
+    }
+
+    pub async fn set_audio_track(&self, track_id: Option<i32>) -> Result<()> {
+        self.send(MpvCommand::AudioTrack(track_id)).await
     }
 
     pub async fn load_subtitle(&self, url: Url) -> Result<()> {
@@ -499,7 +518,10 @@ async fn run_actor(
     )
     .await?;
     set_window_state(&mut writer, &window_title, window_state).await?;
-    for (number, property) in ["time-pos", "pause", "mute", "volume"].iter().enumerate() {
+    for (number, property) in ["time-pos", "pause", "mute", "volume", "track-list"]
+        .iter()
+        .enumerate()
+    {
         send_json(
             &mut writer,
             json!({"command": ["observe_property", number + 1, property]}),
@@ -711,6 +733,14 @@ async fn send_mpv_command<W: AsyncWrite + Unpin>(
         }
         MpvCommand::Mute(muted) => json!({"command": ["set_property", "mute", muted]}),
         MpvCommand::ToggleMute => json!({"command": ["cycle", "mute"]}),
+        MpvCommand::ToggleFullscreen => json!({"command": ["cycle", "fullscreen"]}),
+        MpvCommand::PlaybackRate(rate) => {
+            json!({"command": ["set_property", "speed", rate.max(0.01)]})
+        }
+        MpvCommand::AudioTrack(track_id) => {
+            let track_id = track_id.map_or_else(|| Value::String("no".to_owned()), Value::from);
+            json!({"command": ["set_property", "aid", track_id]})
+        }
         MpvCommand::LoadSubtitle(url) => {
             send_json(writer, json!({"command": ["sub-remove"]})).await?;
             json!({"command": ["sub-add", url, "select"]})
@@ -743,11 +773,40 @@ async fn emit_property(id: Uuid, value: &Value, events: &mpsc::Sender<MpvEvent>)
         Some("pause") => data.as_bool().map(|paused| MpvEvent::Paused { id, paused }),
         Some("mute") => data.as_bool().map(|muted| MpvEvent::Muted { id, muted }),
         Some("volume") => data.as_f64().map(|volume| MpvEvent::Volume { id, volume }),
+        Some("track-list") => {
+            parse_audio_track_ids(data).map(|audio_track_ids| MpvEvent::AudioTracks {
+                id,
+                audio_track_ids,
+            })
+        }
         _ => None,
     };
     if let Some(event) = event {
         let _ = events.send(event).await;
     }
+}
+
+fn parse_audio_track_ids(data: &Value) -> Option<HashMap<i32, i32>> {
+    let tracks = data.as_array()?;
+    Some(
+        tracks
+            .iter()
+            .filter_map(|track| {
+                if track.get("type").and_then(Value::as_str) != Some("audio") {
+                    return None;
+                }
+                let ff_index = track
+                    .get("ff-index")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())?;
+                let track_id = track
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())?;
+                Some((ff_index, track_id))
+            })
+            .collect(),
+    )
 }
 
 async fn emit_client_message(id: Uuid, value: &Value, events: &mpsc::Sender<MpvEvent>) {
@@ -1014,6 +1073,86 @@ mod tests {
         assert_eq!(messages[1]["command"][1], "http://example/subtitle.srt");
         assert_eq!(messages[2]["command"][1], "sid");
         assert_eq!(messages[2]["command"][2], "no");
+    }
+
+    #[tokio::test]
+    async fn emits_audio_track_selection_and_disable_commands() {
+        let (mut writer, mut reader) = duplex(1024);
+        send_mpv_command(&mut writer, MpvCommand::AudioTrack(Some(3)))
+            .await
+            .unwrap();
+        send_mpv_command(&mut writer, MpvCommand::AudioTrack(None))
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let messages: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages[0]["command"], json!(["set_property", "aid", 3]));
+        assert_eq!(messages[1]["command"], json!(["set_property", "aid", "no"]));
+    }
+
+    #[tokio::test]
+    async fn emits_fullscreen_toggle_command() {
+        let (mut writer, mut reader) = duplex(1024);
+        send_mpv_command(&mut writer, MpvCommand::ToggleFullscreen)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let message: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(message["command"], json!(["cycle", "fullscreen"]));
+    }
+
+    #[tokio::test]
+    async fn emits_playback_rate_command() {
+        let (mut writer, mut reader) = duplex(1024);
+        send_mpv_command(&mut writer, MpvCommand::PlaybackRate(1.25))
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let message: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(message["command"], json!(["set_property", "speed", 1.25]));
+    }
+
+    #[tokio::test]
+    async fn parses_audio_track_mapping_from_track_list() {
+        let (events, mut receiver) = mpsc::channel(1);
+        let id = Uuid::new_v4();
+        emit_property(
+            id,
+            &json!({
+                "name": "track-list",
+                "data": [
+                    {"type": "video", "id": 1, "ff-index": 0},
+                    {"type": "audio", "id": 2, "ff-index": 1},
+                    {"type": "audio", "id": 4, "ff-index": 3}
+                ]
+            }),
+            &events,
+        )
+        .await;
+
+        let MpvEvent::AudioTracks {
+            id: event_id,
+            audio_track_ids,
+        } = receiver.recv().await.expect("应产生音轨映射事件")
+        else {
+            panic!("事件类型错误");
+        };
+        assert_eq!(event_id, id);
+        assert_eq!(audio_track_ids.get(&1), Some(&2));
+        assert_eq!(audio_track_ids.get(&3), Some(&4));
+        assert!(!audio_track_ids.contains_key(&0));
     }
 
     #[tokio::test]

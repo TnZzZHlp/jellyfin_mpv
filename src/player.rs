@@ -39,6 +39,7 @@ struct Playback {
     live_stream_id: Option<String>,
     play_method: &'static str,
     audio_stream_index: Option<i32>,
+    audio_track_ids: HashMap<i32, i32>,
     subtitle_stream_index: Option<i32>,
     media_streams: Vec<MediaStream>,
     thumbnail: Option<ThumbnailWorker>,
@@ -204,6 +205,12 @@ impl Player {
                 self.report_progress().await;
                 Ok(())
             }
+            RemoteCommand::VolumeUp => self.adjust_volume(2.0).await,
+            RemoteCommand::VolumeDown => self.adjust_volume(-2.0).await,
+            RemoteCommand::ToggleFullscreen => self.active_mut()?.mpv.toggle_fullscreen().await,
+            RemoteCommand::PlaybackRate(rate) => {
+                self.active_mut()?.mpv.set_playback_rate(rate).await
+            }
             RemoteCommand::Mute(muted) => {
                 let playback = self.active_mut()?;
                 playback.mpv.set_mute(muted).await?;
@@ -218,6 +225,7 @@ impl Player {
                 self.report_progress().await;
                 Ok(())
             }
+            RemoteCommand::SetAudio(index) => self.set_audio(index).await,
             RemoteCommand::SetSubtitle(index) => self.set_subtitle(index).await,
         }
     }
@@ -356,6 +364,7 @@ impl Player {
             live_stream_id: source.live_stream_id.clone(),
             play_method,
             audio_stream_index,
+            audio_track_ids: HashMap::new(),
             subtitle_stream_index,
             media_streams,
             thumbnail,
@@ -412,6 +421,54 @@ impl Player {
         Ok(())
     }
 
+    async fn set_audio(&mut self, index: Option<i32>) -> Result<()> {
+        let Some(index) = index else {
+            let playback = self.active_mut()?;
+            playback.mpv.set_audio_track(None).await?;
+            playback.audio_stream_index = None;
+            self.report_progress().await;
+            info!("音轨已关闭");
+            return Ok(());
+        };
+
+        let (mpv, track_id, stream) = {
+            let playback = self.active_mut()?;
+            let stream = playback
+                .media_streams
+                .iter()
+                .find(|stream| stream.stream_type == "Audio" && stream.index == index)
+                .cloned()
+                .ok_or_else(|| anyhow!("找不到音轨索引 {index}"))?;
+            let track_id = playback
+                .audio_track_ids
+                .get(&index)
+                .copied()
+                .unwrap_or(index);
+            (playback.mpv.clone(), track_id, stream)
+        };
+        mpv.set_audio_track(Some(track_id)).await?;
+
+        let playback = self.active_mut()?;
+        playback.audio_stream_index = Some(index);
+        let title = stream
+            .display_title
+            .as_deref()
+            .or(stream.language.as_deref())
+            .unwrap_or("未知音轨");
+        info!(index, track_id, title, "音轨已切换");
+        self.report_progress().await;
+        Ok(())
+    }
+
+    async fn adjust_volume(&mut self, delta: f64) -> Result<()> {
+        let playback = self.active_mut()?;
+        let volume = (playback.volume + delta).clamp(0.0, 100.0);
+        playback.mpv.set_volume(volume).await?;
+        playback.volume = volume;
+        self.report_progress().await;
+        Ok(())
+    }
+
     async fn handle_mpv_event(&mut self, event: MpvEvent) -> Result<()> {
         let event_id = match &event {
             MpvEvent::FileLoaded { id }
@@ -419,6 +476,7 @@ impl Player {
             | MpvEvent::Paused { id, .. }
             | MpvEvent::Muted { id, .. }
             | MpvEvent::Volume { id, .. }
+            | MpvEvent::AudioTracks { id, .. }
             | MpvEvent::Preview { id, .. }
             | MpvEvent::Ended { id, .. }
             | MpvEvent::Terminated { id, .. } => *id,
@@ -450,6 +508,14 @@ impl Player {
                 if volume.is_finite() {
                     self.playback.as_mut().expect("已核对播放 ID").volume = volume;
                 }
+            }
+            MpvEvent::AudioTracks {
+                audio_track_ids, ..
+            } => {
+                self.playback
+                    .as_mut()
+                    .expect("已核对播放 ID")
+                    .audio_track_ids = audio_track_ids;
             }
             MpvEvent::Preview { request, .. } => {
                 if let Some(thumbnail) = self

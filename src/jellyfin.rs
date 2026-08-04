@@ -45,6 +45,20 @@ pub struct JellyfinClient {
     reauthenticate: Mutex<()>,
 }
 
+fn session_capabilities() -> Value {
+    json!({
+        "PlayableMediaTypes": ["Video", "Audio"],
+        "SupportedCommands": [
+            "PlayMediaSource",
+            "SetVolume", "VolumeUp", "VolumeDown", "ToggleFullscreen",
+            "Mute", "Unmute", "ToggleMute",
+            "SetAudioStreamIndex", "SetSubtitleStreamIndex", "PlaybackRate"
+        ],
+        "SupportsMediaControl": true,
+        "SupportsPersistentIdentifier": true
+    })
+}
+
 struct AuthState {
     access_token: String,
     http: Client,
@@ -141,17 +155,12 @@ impl JellyfinClient {
     }
 
     pub async fn register_capabilities(&self) -> Result<()> {
-        let body = json!({
-            "PlayableMediaTypes": ["Video", "Audio"],
-            "SupportedCommands": [
-                "SetVolume", "Mute", "Unmute", "ToggleMute", "SetSubtitleStreamIndex"
-            ],
-            "SupportsMediaControl": true,
-            "SupportsPersistentIdentifier": true
-        });
-        self.post_json(self.endpoint(&["Sessions", "Capabilities", "Full"])?, &body)
-            .await
-            .context("注册 Jellyfin 播放设备失败")
+        self.post_json(
+            self.endpoint(&["Sessions", "Capabilities", "Full"])?,
+            &session_capabilities(),
+        )
+        .await
+        .context("注册 Jellyfin 播放设备失败")
     }
 
     pub async fn item(&self, user_id: &str, item_id: &str) -> Result<ItemDto> {
@@ -746,6 +755,19 @@ mod tests {
 
     use super::*;
     use crate::config::ConfigArgs;
+
+    #[test]
+    fn advertises_media_source_playback() {
+        let capabilities = session_capabilities();
+        let commands = capabilities["SupportedCommands"]
+            .as_array()
+            .expect("SupportedCommands 应为数组");
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.as_str() == Some("PlayMediaSource"))
+        );
+    }
 
     #[test]
     fn websocket_handshake_uses_query_and_standard_authentication() {
