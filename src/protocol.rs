@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -94,7 +94,7 @@ pub struct PlaybackQueueItem {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlayRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_item_ids")]
     pub item_ids: Vec<String>,
     #[serde(default)]
     pub play_command: PlayCommand,
@@ -187,6 +187,28 @@ fn parse_playback_order(value: &str) -> Option<PlaybackOrder> {
         "shuffle" => Some(PlaybackOrder::Shuffle),
         "sorted" | "default" => Some(PlaybackOrder::Default),
         _ => None,
+    }
+}
+
+fn deserialize_item_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ItemIds {
+        List(Vec<String>),
+        Joined(String),
+    }
+
+    match ItemIds::deserialize(deserializer)? {
+        ItemIds::List(ids) => Ok(ids),
+        ItemIds::Joined(ids) => Ok(ids
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .collect()),
     }
 }
 
@@ -426,6 +448,16 @@ mod tests {
         assert_eq!(request.item_ids, ["abc"]);
         assert_eq!(request.play_command, PlayCommand::PlayNow);
         assert_eq!(request.start_position_ticks, Some(42));
+
+        let selected_source =
+            r#"{"MessageType":"Play","Data":{"ItemIds":"abc, def","MediaSourceId":"source-2"}}"#;
+        let SocketAction::Command(RemoteCommand::Play(request)) =
+            parse_socket_message(selected_source).unwrap()
+        else {
+            panic!("未解析为视频版本播放命令");
+        };
+        assert_eq!(request.item_ids, ["abc", "def"]);
+        assert_eq!(request.media_source_id.as_deref(), Some("source-2"));
 
         let seek =
             r#"{"MessageType":"Playstate","Data":{"Command":"Seek","SeekPositionTicks":99}}"#;
