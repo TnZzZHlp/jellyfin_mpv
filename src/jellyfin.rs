@@ -50,7 +50,9 @@ fn session_capabilities() -> Value {
         "PlayableMediaTypes": ["Video", "Audio"],
         "SupportedCommands": [
             "PlayMediaSource",
-            "SetVolume", "Mute", "Unmute", "ToggleMute", "SetSubtitleStreamIndex"
+            "SetVolume", "VolumeUp", "VolumeDown", "ToggleFullscreen",
+            "Mute", "Unmute", "ToggleMute",
+            "SetAudioStreamIndex", "SetSubtitleStreamIndex", "PlaybackRate"
         ],
         "SupportsMediaControl": true,
         "SupportsPersistentIdentifier": true

@@ -12,8 +12,13 @@ pub enum RemoteCommand {
     Stop,
     Seek(i64),
     SetVolume(f64),
+    VolumeUp,
+    VolumeDown,
+    ToggleFullscreen,
+    PlaybackRate(f64),
     Mute(bool),
     ToggleMute,
+    SetAudio(Option<i32>),
     SetSubtitle(Option<i32>),
 }
 
@@ -27,8 +32,13 @@ impl RemoteCommand {
             Self::Stop => "Stop",
             Self::Seek(_) => "Seek",
             Self::SetVolume(_) => "SetVolume",
+            Self::VolumeUp => "VolumeUp",
+            Self::VolumeDown => "VolumeDown",
+            Self::ToggleFullscreen => "ToggleFullscreen",
+            Self::PlaybackRate(_) => "PlaybackRate",
             Self::Mute(_) => "Mute",
             Self::ToggleMute => "ToggleMute",
+            Self::SetAudio(_) => "SetAudio",
             Self::SetSubtitle(_) => "SetSubtitle",
         }
     }
@@ -72,7 +82,27 @@ struct PlaystateRequest {
 struct GeneralCommand {
     name: String,
     #[serde(default)]
-    arguments: HashMap<String, String>,
+    arguments: HashMap<String, Value>,
+}
+
+fn argument_f64(arguments: &HashMap<String, Value>, names: &[&str]) -> Option<f64> {
+    names.iter().find_map(|name| {
+        arguments.get(*name).and_then(|value| match value {
+            Value::Number(value) => value.as_f64(),
+            Value::String(value) => value.parse().ok(),
+            _ => None,
+        })
+    })
+}
+
+fn argument_i32(arguments: &HashMap<String, Value>, names: &[&str]) -> Option<i32> {
+    names.iter().find_map(|name| {
+        arguments.get(*name).and_then(|value| match value {
+            Value::Number(value) => value.as_i64().and_then(|value| i32::try_from(value).ok()),
+            Value::String(value) => value.parse().ok(),
+            _ => None,
+        })
+    })
 }
 
 pub enum SocketAction {
@@ -109,22 +139,30 @@ pub fn parse_socket_message(text: &str) -> Result<SocketAction, serde_json::Erro
         "GeneralCommand" => {
             let request: GeneralCommand = serde_json::from_value(envelope.data)?;
             let command = match request.name.as_str() {
-                "SetVolume" => request
-                    .arguments
-                    .get("Volume")
-                    .or_else(|| request.arguments.get("volume"))
-                    .and_then(|value| value.parse::<f64>().ok())
+                "SetVolume" => argument_f64(&request.arguments, &["Volume", "volume"])
+                    .filter(|value| value.is_finite())
                     .map(RemoteCommand::SetVolume),
+                "VolumeUp" => Some(RemoteCommand::VolumeUp),
+                "VolumeDown" => Some(RemoteCommand::VolumeDown),
+                "ToggleFullscreen" => Some(RemoteCommand::ToggleFullscreen),
+                "PlaybackRate" => argument_f64(
+                    &request.arguments,
+                    &["PlaybackRate", "playbackRate", "rate"],
+                )
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(RemoteCommand::PlaybackRate),
                 "Mute" => Some(RemoteCommand::Mute(true)),
                 "Unmute" => Some(RemoteCommand::Mute(false)),
                 "ToggleMute" => Some(RemoteCommand::ToggleMute),
-                "SetSubtitleStreamIndex" => request
-                    .arguments
-                    .get("Index")
-                    .or_else(|| request.arguments.get("SubtitleStreamIndex"))
-                    .or_else(|| request.arguments.get("index"))
-                    .and_then(|value| value.parse::<i32>().ok())
-                    .map(|index| RemoteCommand::SetSubtitle((index >= 0).then_some(index))),
+                "SetAudioStreamIndex" => {
+                    argument_i32(&request.arguments, &["Index", "AudioStreamIndex", "index"])
+                        .map(|index| RemoteCommand::SetAudio((index >= 0).then_some(index)))
+                }
+                "SetSubtitleStreamIndex" => argument_i32(
+                    &request.arguments,
+                    &["Index", "SubtitleStreamIndex", "index"],
+                )
+                .map(|index| RemoteCommand::SetSubtitle((index >= 0).then_some(index))),
                 _ => None,
             };
             Ok(command.map_or_else(
@@ -312,11 +350,37 @@ mod tests {
             SocketAction::Command(RemoteCommand::SetVolume(37.0))
         ));
 
+        let numeric_volume = r#"{"MessageType":"GeneralCommand","Data":{"Name":"SetVolume","Arguments":{"Volume":37}}}"#;
+        assert!(matches!(
+            parse_socket_message(numeric_volume).unwrap(),
+            SocketAction::Command(RemoteCommand::SetVolume(37.0))
+        ));
+
+        let rate = r#"{"MessageType":"GeneralCommand","Data":{"Name":"PlaybackRate","Arguments":{"PlaybackRate":1.25}}}"#;
+        assert!(matches!(
+            parse_socket_message(rate).unwrap(),
+            SocketAction::Command(RemoteCommand::PlaybackRate(1.25))
+        ));
+
         let mute = r#"{"MessageType":"GeneralCommand","Data":{"Name":"Mute","Arguments":{}}}"#;
         assert!(matches!(
             parse_socket_message(mute).unwrap(),
             SocketAction::Command(RemoteCommand::Mute(true))
         ));
+
+        for (command, expected) in [
+            ("VolumeUp", RemoteCommand::VolumeUp),
+            ("VolumeDown", RemoteCommand::VolumeDown),
+            ("ToggleFullscreen", RemoteCommand::ToggleFullscreen),
+        ] {
+            let message = format!(
+                r#"{{"MessageType":"GeneralCommand","Data":{{"Name":"{command}","Arguments":{{}}}}}}"#
+            );
+            assert!(matches!(
+                parse_socket_message(&message).unwrap(),
+                SocketAction::Command(actual) if actual.name() == expected.name()
+            ));
+        }
     }
 
     #[test]
@@ -340,6 +404,21 @@ mod tests {
         assert!(matches!(
             parse_socket_message(disable).unwrap(),
             SocketAction::Command(RemoteCommand::SetSubtitle(None))
+        ));
+    }
+
+    #[test]
+    fn parses_audio_selection_and_disable() {
+        let select = r#"{"MessageType":"GeneralCommand","Data":{"Name":"SetAudioStreamIndex","Arguments":{"Index":"3"}}}"#;
+        assert!(matches!(
+            parse_socket_message(select).unwrap(),
+            SocketAction::Command(RemoteCommand::SetAudio(Some(3)))
+        ));
+
+        let disable = r#"{"MessageType":"GeneralCommand","Data":{"Name":"SetAudioStreamIndex","Arguments":{"Index":"-1"}}}"#;
+        assert!(matches!(
+            parse_socket_message(disable).unwrap(),
+            SocketAction::Command(RemoteCommand::SetAudio(None))
         ));
     }
 }
