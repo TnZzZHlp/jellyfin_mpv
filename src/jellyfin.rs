@@ -53,7 +53,9 @@ fn session_capabilities() -> Value {
             "PlayMediaSource",
             "SetVolume", "VolumeUp", "VolumeDown", "ToggleFullscreen",
             "Mute", "Unmute", "ToggleMute",
-            "SetAudioStreamIndex", "SetSubtitleStreamIndex", "PlaybackRate",
+            // PlaybackRate 不是 Jellyfin GeneralCommandType 的成员。声明它会让
+            // /Sessions/Capabilities/Full 拒绝整个请求，进而丢失 PlayMediaSource。
+            "SetAudioStreamIndex", "SetSubtitleStreamIndex",
             "SetRepeatMode", "SetShuffleQueue", "SetMaxStreamingBitrate"
         ],
         "SupportsMediaControl": true,
@@ -453,7 +455,7 @@ impl JellyfinClient {
 
         // WebSocket 建立后再更新一次，确保当前 session 可被远程控制。
         if let Err(error) = self.register_capabilities().await {
-            warn!(%error, "WebSocket 连接后更新设备能力失败");
+            warn!(error = %format!("{error:#}"), "WebSocket 连接后更新设备能力失败");
         }
 
         let mut keepalive = interval_at(
@@ -784,6 +786,11 @@ mod tests {
             commands
                 .iter()
                 .any(|command| command.as_str() == Some("SetMaxStreamingBitrate"))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.as_str() == Some("PlaybackRate"))
         );
     }
 

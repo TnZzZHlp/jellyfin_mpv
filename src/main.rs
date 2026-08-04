@@ -139,7 +139,7 @@ async fn run() -> Result<()> {
 
         let client = Arc::new(client);
         if let Err(error) = client.register_capabilities().await {
-            warn!(%error, "注册 Jellyfin 播放设备失败，将在 WebSocket 连接后重试");
+            warn!(error = %format!("{error:#}"), "注册 Jellyfin 播放设备失败，将在 WebSocket 连接后重试");
         }
         info!(
             server = %config.server,
