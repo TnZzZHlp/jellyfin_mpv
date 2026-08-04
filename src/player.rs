@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     jellyfin::{JellyfinClient, PlaybackConstraints},
-    mpv::{MpvEvent, MpvHandle, MpvLaunch, MpvQualitySelection, spawn_mpv},
+    mpv::{MpvEndReason, MpvEvent, MpvHandle, MpvLaunch, MpvQualitySelection, spawn_mpv},
     protocol::{
         MediaSegment, MediaStream, PlayCommand, PlayRequest, PlaybackOrder, PlaybackQueueItem,
         PlaybackReport, PlaybackStopReport, RemoteCommand, RepeatMode,
@@ -1185,20 +1185,26 @@ impl Player {
             MpvEvent::Quality { selection, .. } => {
                 self.set_quality(selection).await?;
             }
-            MpvEvent::Ended { failed, .. } | MpvEvent::Terminated { failed, .. } => {
-                self.handle_playback_end(failed).await?;
+            MpvEvent::Ended { reason, .. } => match reason {
+                MpvEndReason::Eof => self.handle_natural_playback_end().await?,
+                MpvEndReason::Stopped => self.stop_after_mpv_end(false).await,
+                MpvEndReason::Failed => self.stop_after_mpv_end(true).await,
+            },
+            MpvEvent::Terminated { failed, .. } => {
+                // 没有收到 end-file 的进程退出（例如用户直接关闭窗口）也必须
+                // 结束整个队列，而不是把它误当作当前条目自然播完。
+                self.stop_after_mpv_end(failed).await;
             }
         }
         Ok(())
     }
 
-    async fn handle_playback_end(&mut self, failed: bool) -> Result<()> {
-        if failed {
-            self.queue = None;
-            self.stop_current(true).await;
-            return Ok(());
-        }
+    async fn stop_after_mpv_end(&mut self, failed: bool) {
+        self.queue = None;
+        self.stop_current(failed).await;
+    }
 
+    async fn handle_natural_playback_end(&mut self) -> Result<()> {
         let next = self
             .queue
             .as_ref()

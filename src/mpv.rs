@@ -191,12 +191,32 @@ pub enum MpvEvent {
     },
     Ended {
         id: Uuid,
-        failed: bool,
+        reason: MpvEndReason,
     },
     Terminated {
         id: Uuid,
         failed: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MpvEndReason {
+    /// 媒体已自然播放至结尾，可继续播放队列中的下一项。
+    Eof,
+    /// mpv 被关闭、停止，或出现无法继续的非媒体错误状态。
+    Stopped,
+    /// mpv 无法读取当前媒体。
+    Failed,
+}
+
+fn end_reason_from_mpv(reason: Option<&str>) -> Option<MpvEndReason> {
+    match reason {
+        Some("eof") => Some(MpvEndReason::Eof),
+        Some("error") => Some(MpvEndReason::Failed),
+        // mpv 在 HTTP 重定向等场景会自行继续加载媒体，不能把它当作队列结束。
+        Some("redirect") => None,
+        _ => Some(MpvEndReason::Stopped),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -722,9 +742,8 @@ async fn run_actor(
                             let reason = value.get("reason").and_then(Value::as_str);
                             if is_replaced_stream_end(reason, replacing_stream) {
                                 debug!(?reason, "忽略同一 mpv 进程换流产生的旧流结束事件");
-                            } else {
-                                let failed = reason == Some("error");
-                                let _ = events.send(MpvEvent::Ended { id, failed }).await;
+                            } else if let Some(reason) = end_reason_from_mpv(reason) {
+                                let _ = events.send(MpvEvent::Ended { id, reason }).await;
                             }
                         } else if value.get("event").and_then(Value::as_str) == Some("shutdown") {
                             break;
@@ -1313,6 +1332,24 @@ mod tests {
         assert!(is_replaced_stream_end(Some("stop"), true));
         assert!(!is_replaced_stream_end(Some("error"), true));
         assert!(!is_replaced_stream_end(Some("stop"), false));
+    }
+
+    #[test]
+    fn distinguishes_natural_end_from_window_close_and_errors() {
+        assert_eq!(end_reason_from_mpv(Some("eof")), Some(MpvEndReason::Eof));
+        assert_eq!(
+            end_reason_from_mpv(Some("stop")),
+            Some(MpvEndReason::Stopped)
+        );
+        assert_eq!(
+            end_reason_from_mpv(Some("quit")),
+            Some(MpvEndReason::Stopped)
+        );
+        assert_eq!(
+            end_reason_from_mpv(Some("error")),
+            Some(MpvEndReason::Failed)
+        );
+        assert_eq!(end_reason_from_mpv(Some("redirect")), None);
     }
 
     #[tokio::test]
