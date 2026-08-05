@@ -38,6 +38,8 @@ use crate::{
 const CLIENT_NAME: &str = "Jellyfin MPV Cast";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_TRICKPLAY_TILE_BYTES: u64 = 32 * 1024 * 1024;
+// Jellyfin 10.7+ binds these fields as System.Int32.
+const MAX_JELLYFIN_STREAMING_BITRATE: i64 = i32::MAX as i64;
 
 pub struct JellyfinClient {
     config: Config,
@@ -48,11 +50,12 @@ pub struct JellyfinClient {
 fn session_capabilities() -> Value {
     json!({
         "PlayableMediaTypes": ["Video", "Audio"],
+        // "PlaybackRate" 不是 Jellyfin GeneralCommandType，不能在此通告。
         "SupportedCommands": [
             "PlayMediaSource",
             "SetVolume", "VolumeUp", "VolumeDown", "ToggleFullscreen",
             "Mute", "Unmute", "ToggleMute",
-            "SetAudioStreamIndex", "SetSubtitleStreamIndex", "PlaybackRate"
+            "SetAudioStreamIndex", "SetSubtitleStreamIndex"
         ],
         "SupportsMediaControl": true,
         "SupportsPersistentIdentifier": true
@@ -449,7 +452,10 @@ impl JellyfinClient {
 
         // WebSocket 建立后再更新一次，确保当前 session 可被远程控制。
         if let Err(error) = self.register_capabilities().await {
-            warn!(%error, "WebSocket 连接后更新设备能力失败");
+            warn!(
+                error = %format!("{error:#}"),
+                "WebSocket 连接后更新设备能力失败"
+            );
         }
 
         let mut keepalive = interval_at(
@@ -698,8 +704,8 @@ fn playback_profile(
     max_streaming_bitrate: Option<u64>,
 ) -> Value {
     let max_streaming_bitrate = max_streaming_bitrate
-        .map(|value| value.min(i64::MAX as u64) as i64)
-        .unwrap_or(i64::MAX);
+        .map(|value| value.min(MAX_JELLYFIN_STREAMING_BITRATE as u64) as i64)
+        .unwrap_or(MAX_JELLYFIN_STREAMING_BITRATE);
 
     json!({
         "UserId": user_id,
@@ -767,7 +773,7 @@ mod tests {
     use crate::config::ConfigArgs;
 
     #[test]
-    fn advertises_media_source_playback() {
+    fn advertises_only_supported_general_commands() {
         let capabilities = session_capabilities();
         let commands = capabilities["SupportedCommands"]
             .as_array()
@@ -776,6 +782,11 @@ mod tests {
             commands
                 .iter()
                 .any(|command| command.as_str() == Some("PlayMediaSource"))
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.as_str() != Some("PlaybackRate"))
         );
     }
 
@@ -791,6 +802,27 @@ mod tests {
             profile["DeviceProfile"]["MaxStaticBitrate"],
             json!(1_500_000)
         );
+    }
+
+    #[test]
+    fn bounds_default_and_requested_streaming_bitrate_to_jellyfin_int32() {
+        for profile in [
+            playback_profile("user-1", 42, None, None, None, None),
+            playback_profile("user-1", 42, None, None, None, Some(u64::MAX)),
+        ] {
+            assert_eq!(
+                profile["MaxStreamingBitrate"],
+                json!(MAX_JELLYFIN_STREAMING_BITRATE)
+            );
+            assert_eq!(
+                profile["DeviceProfile"]["MaxStreamingBitrate"],
+                json!(MAX_JELLYFIN_STREAMING_BITRATE)
+            );
+            assert_eq!(
+                profile["DeviceProfile"]["MaxStaticBitrate"],
+                json!(MAX_JELLYFIN_STREAMING_BITRATE)
+            );
+        }
     }
 
     #[test]
@@ -952,6 +984,67 @@ mod tests {
             requests[2]
                 .to_ascii_lowercase()
                 .contains("x-emby-token: token")
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_an_int32_compatible_default_playback_profile() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _authentication_request = read_request(&mut stream).await;
+            write_response(
+                &mut stream,
+                200,
+                r#"{"AccessToken":"token","User":{"Id":"user-1","Name":"Alice"}}"#,
+            )
+            .await;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let playback_request = read_request(&mut stream).await;
+            write_response(&mut stream, 200, r#"{"MediaSources":[]}"#).await;
+            playback_request
+        });
+
+        let encoded = STANDARD.encode("password");
+        let config = ConfigArgs::try_parse_from([
+            "jellyfin-mpv",
+            "--server",
+            &format!("http://{address}"),
+            "--username",
+            "Alice",
+            "--password",
+            &encoded,
+            "--device-id",
+            "test-device",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap()
+        .unwrap();
+        let (client, _) = JellyfinClient::connect(config).await.unwrap();
+
+        let info = client
+            .playback_info("user-1", "item-1", 0, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(info.media_sources.is_empty());
+
+        let playback_request = server.await.unwrap();
+        let (_, body) = playback_request.split_once("\r\n\r\n").unwrap();
+        let profile: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            profile["MaxStreamingBitrate"],
+            json!(MAX_JELLYFIN_STREAMING_BITRATE)
+        );
+        assert_eq!(
+            profile["DeviceProfile"]["MaxStreamingBitrate"],
+            json!(MAX_JELLYFIN_STREAMING_BITRATE)
+        );
+        assert_eq!(
+            profile["DeviceProfile"]["MaxStaticBitrate"],
+            json!(MAX_JELLYFIN_STREAMING_BITRATE)
         );
     }
 
