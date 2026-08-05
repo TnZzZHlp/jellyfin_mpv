@@ -241,6 +241,7 @@ pub struct PlaybackInfoResponse {
 #[serde(rename_all = "PascalCase")]
 pub struct MediaSource {
     pub id: Option<String>,
+    pub bitrate: Option<i64>,
     #[serde(default)]
     pub supports_direct_play: bool,
     pub transcoding_url: Option<String>,

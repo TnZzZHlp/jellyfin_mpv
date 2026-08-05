@@ -239,6 +239,7 @@ impl JellyfinClient {
         Ok(result.items)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn playback_info(
         &self,
         user_id: &str,
@@ -247,6 +248,7 @@ impl JellyfinClient {
         media_source_id: Option<&str>,
         audio_index: Option<i32>,
         subtitle_index: Option<i32>,
+        max_streaming_bitrate: Option<u64>,
     ) -> Result<PlaybackInfoResponse> {
         let mut url = self.endpoint(&["Items", item_id, "PlaybackInfo"])?;
         {
@@ -277,6 +279,7 @@ impl JellyfinClient {
                     media_source_id,
                     audio_index,
                     subtitle_index,
+                    max_streaming_bitrate,
                 ),
             )
             .await
@@ -294,7 +297,8 @@ impl JellyfinClient {
 
     pub fn stream_url(
         &self,
-        item: &ItemDto,
+        item_id: &str,
+        media_type: Option<&str>,
         source_id: &str,
         play_session_id: &str,
         transcoding_url: Option<&str>,
@@ -305,12 +309,12 @@ impl JellyfinClient {
                 .join(path.trim_start_matches('/'))
                 .context("Jellyfin 返回了非法转码地址")?
         } else {
-            let kind = if item.media_type.as_deref() == Some("Audio") {
+            let kind = if media_type == Some("Audio") {
                 "Audio"
             } else {
                 "Videos"
             };
-            let mut direct = self.endpoint(&[kind, &item.id, "stream"])?;
+            let mut direct = self.endpoint(&[kind, item_id, "stream"])?;
             direct
                 .query_pairs_mut()
                 .append_pair("static", "true")
@@ -691,13 +695,19 @@ fn playback_profile(
     media_source_id: Option<&str>,
     audio_index: Option<i32>,
     subtitle_index: Option<i32>,
+    max_streaming_bitrate: Option<u64>,
 ) -> Value {
+    let max_streaming_bitrate = max_streaming_bitrate
+        .map(|value| value.min(i64::MAX as u64) as i64)
+        .unwrap_or(i64::MAX);
+
     json!({
         "UserId": user_id,
         "StartTimeTicks": start_ticks,
         "MediaSourceId": media_source_id,
         "AudioStreamIndex": audio_index,
         "SubtitleStreamIndex": subtitle_index,
+        "MaxStreamingBitrate": max_streaming_bitrate,
         "EnableDirectPlay": true,
         "EnableDirectStream": true,
         "EnableTranscoding": true,
@@ -706,8 +716,8 @@ fn playback_profile(
         "AutoOpenLiveStream": true,
         "DeviceProfile": {
             "Name": "mpv",
-            "MaxStreamingBitrate": 2_147_483_647_i64,
-            "MaxStaticBitrate": 2_147_483_647_i64,
+            "MaxStreamingBitrate": max_streaming_bitrate,
+            "MaxStaticBitrate": max_streaming_bitrate,
             "DirectPlayProfiles": [
                 {
                     "Type": "Video",
@@ -766,6 +776,20 @@ mod tests {
             commands
                 .iter()
                 .any(|command| command.as_str() == Some("PlayMediaSource"))
+        );
+    }
+
+    #[test]
+    fn applies_dynamic_max_streaming_bitrate_to_playback_profile() {
+        let profile = playback_profile("user-1", 42, None, None, None, Some(1_500_000));
+        assert_eq!(profile["MaxStreamingBitrate"], json!(1_500_000));
+        assert_eq!(
+            profile["DeviceProfile"]["MaxStreamingBitrate"],
+            json!(1_500_000)
+        );
+        assert_eq!(
+            profile["DeviceProfile"]["MaxStaticBitrate"],
+            json!(1_500_000)
         );
     }
 

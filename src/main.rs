@@ -22,7 +22,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    time::{Duration, sleep},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt::time::ChronoLocal};
@@ -32,6 +35,9 @@ use crate::{
     login_ui::show_error_message, mpv::MpvEvent, player::Player, settings_ui::SettingsContext,
     skip_settings::SkipSettingsStore, tray::TrayIcon,
 };
+
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() {
@@ -60,17 +66,35 @@ async fn run() -> Result<()> {
     let Some(mut config) = ConfigArgs::parse().resolve()? else {
         return Ok(());
     };
+    let mut initial_retry_delay = INITIAL_RETRY_DELAY;
     let initial_connection = loop {
-        match JellyfinClient::connect(config.clone()).await {
-            Ok(connected) => break connected,
-            Err(error) if config.loaded_login() => {
-                warn!(%error, "保存的登录信息无效，重新显示登录窗口");
-                let Some(updated) = config.prompt_for_login()? else {
-                    return Ok(());
-                };
-                config = updated;
+        let connection = tokio::select! {
+            connection = JellyfinClient::connect(config.clone()) => connection,
+            _ = tokio::signal::ctrl_c() => {
+                info!("收到退出信号");
+                return Ok(());
             }
-            Err(error) => return Err(error),
+        };
+        match connection {
+            Ok(connected) => break connected,
+            Err(error) => {
+                warn!(
+                    %error,
+                    server = %config.server,
+                    retry_seconds = initial_retry_delay.as_secs(),
+                    "连接 Jellyfin 失败，将继续使用现有登录信息重试"
+                );
+                tokio::select! {
+                    _ = sleep(initial_retry_delay) => {
+                        initial_retry_delay = (initial_retry_delay + initial_retry_delay)
+                            .min(MAX_RETRY_DELAY);
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("收到退出信号");
+                        return Ok(());
+                    }
+                }
+            }
         }
     };
 
@@ -115,21 +139,28 @@ async fn run() -> Result<()> {
         let (client, user) = if let Some(connected) = connection.take() {
             connected
         } else {
+            let mut retry_delay = INITIAL_RETRY_DELAY;
             loop {
                 match JellyfinClient::connect(config.clone()).await {
                     Ok(connected) => break connected,
                     Err(error) => {
-                        warn!(%error, server = %config.server, "重新连接 Jellyfin 失败");
-                        show_error_message(&format!(
-                            "无法连接新的 Jellyfin 服务器：{error:#}\n\n请通过托盘菜单重新打开设置进行修改。"
-                        ));
+                        warn!(
+                            %error,
+                            server = %config.server,
+                            retry_seconds = retry_delay.as_secs(),
+                            "重新连接 Jellyfin 失败，将持续重试"
+                        );
                         tokio::select! {
                             () = shutdown.cancelled() => break 'connections Ok(()),
+                            () = sleep(retry_delay) => {
+                                retry_delay = (retry_delay + retry_delay).min(MAX_RETRY_DELAY);
+                            }
                             update = connection_update_rx.recv() => {
                                 let Some(login) = update else {
                                     break 'connections Ok(());
                                 };
                                 config.apply_login(login)?;
+                                retry_delay = INITIAL_RETRY_DELAY;
                             }
                         }
                     }

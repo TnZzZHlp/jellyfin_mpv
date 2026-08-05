@@ -5,18 +5,13 @@ use serde::{Deserialize, Serialize};
 
 pub const ALL_SEGMENT_TYPES: [&str; 5] = ["Intro", "Outro", "Recap", "Preview", "Commercial"];
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlaybackMode {
     Windowed,
+    #[default]
     Maximized,
     Fullscreen,
-}
-
-impl Default for PlaybackMode {
-    fn default() -> Self {
-        Self::Maximized
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -25,6 +20,7 @@ pub struct SkipSettings {
     #[serde(alias = "always_on_top")]
     pub bring_to_front_on_start: bool,
     pub playback_mode: PlaybackMode,
+    pub auto_adjust_bitrate: bool,
     pub intro: bool,
     pub outro: bool,
     pub recap: bool,
@@ -37,6 +33,7 @@ impl Default for SkipSettings {
         Self {
             bring_to_front_on_start: false,
             playback_mode: PlaybackMode::Maximized,
+            auto_adjust_bitrate: false,
             intro: true,
             outro: true,
             recap: false,
@@ -145,6 +142,7 @@ mod tests {
         let settings = SkipSettings::default();
         assert!(!settings.bring_to_front_on_start);
         assert_eq!(settings.playback_mode, PlaybackMode::Maximized);
+        assert!(!settings.auto_adjust_bitrate);
         assert!(settings.is_enabled("Intro"));
         assert!(settings.is_enabled("Outro"));
         assert!(!settings.is_enabled("Recap"));
@@ -161,6 +159,7 @@ mod tests {
         let expected = SkipSettings {
             bring_to_front_on_start: true,
             playback_mode: PlaybackMode::Fullscreen,
+            auto_adjust_bitrate: true,
             intro: false,
             outro: true,
             recap: true,
@@ -182,6 +181,7 @@ mod tests {
 
         assert!(!settings.bring_to_front_on_start);
         assert_eq!(settings.playback_mode, PlaybackMode::Maximized);
+        assert!(!settings.auto_adjust_bitrate);
         assert!(!settings.intro);
         assert!(!settings.outro);
     }

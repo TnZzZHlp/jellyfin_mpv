@@ -56,7 +56,6 @@ pub struct Config {
     pub mpv_path: PathBuf,
     pub mpv_args: Vec<OsString>,
     persist_login: bool,
-    loaded_login: bool,
 }
 
 impl ConfigArgs {
@@ -65,7 +64,6 @@ impl ConfigArgs {
         let mut username = normalize_username(self.username);
         let mut password = self.password.map(decode_password).transpose()?;
         let mut persist_login = false;
-        let mut loaded_login = false;
         let has_explicit_login = server.is_some() || username.is_some() || password.is_some();
 
         if server.is_none() || username.is_none() || password.is_none() {
@@ -95,7 +93,6 @@ impl ConfigArgs {
                 server = Some(saved_server);
                 username = normalize_username(Some(saved.username.clone()));
                 password = Some(saved.password.clone());
-                loaded_login = true;
             }
 
             if let (Some(saved_server), Some(saved_username), Some(saved_password)) =
@@ -110,7 +107,6 @@ impl ConfigArgs {
                     mpv_path: self.mpv_path,
                     mpv_args: self.mpv_args,
                     persist_login,
-                    loaded_login,
                 }
                 .normalize()
                 .map(Some);
@@ -149,7 +145,6 @@ impl ConfigArgs {
             mpv_path: self.mpv_path,
             mpv_args: self.mpv_args,
             persist_login,
-            loaded_login,
         }
         .normalize()
         .map(Some)
@@ -226,30 +221,8 @@ impl Config {
         updated.username = Some(login.username);
         updated.password = Some(login.password);
         updated.persist_login = false;
-        updated.loaded_login = false;
         *self = updated.normalize()?;
         Ok(())
-    }
-
-    pub fn loaded_login(&self) -> bool {
-        self.loaded_login
-    }
-
-    pub fn prompt_for_login(mut self) -> Result<Option<Self>> {
-        let defaults = LoginDefaults {
-            server: self.server.to_string(),
-            username: self.username.clone().unwrap_or_default(),
-            password: self.password.clone().unwrap_or_default(),
-        };
-        let Some(input) = prompt_login(defaults)? else {
-            return Ok(None);
-        };
-        self.server = input.server;
-        self.username = Some(input.username);
-        self.password = Some(input.password);
-        self.persist_login = true;
-        self.loaded_login = false;
-        self.normalize().map(Some)
     }
 }
 

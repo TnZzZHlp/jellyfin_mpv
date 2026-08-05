@@ -169,6 +169,10 @@ pub enum MpvEvent {
         id: Uuid,
         paused: bool,
     },
+    Buffering {
+        id: Uuid,
+        buffering: bool,
+    },
     Muted {
         id: Uuid,
         muted: bool,
@@ -218,6 +222,7 @@ pub struct Overlay {
 
 enum MpvCommand {
     Headers(Vec<String>),
+    LoadFile(LoadRequest),
     Pause(bool),
     Seek(f64),
     Volume(f64),
@@ -236,6 +241,12 @@ enum MpvCommand {
     Quit,
 }
 
+struct LoadRequest {
+    url: Url,
+    start_seconds: f64,
+    subtitle_url: Option<Url>,
+}
+
 #[derive(Clone)]
 pub struct MpvHandle {
     pub id: Uuid,
@@ -249,6 +260,20 @@ impl MpvHandle {
 
     pub async fn set_pause(&self, paused: bool) -> Result<()> {
         self.send(MpvCommand::Pause(paused)).await
+    }
+
+    pub async fn load_file(
+        &self,
+        url: Url,
+        start_seconds: f64,
+        subtitle_url: Option<Url>,
+    ) -> Result<()> {
+        self.send(MpvCommand::LoadFile(LoadRequest {
+            url,
+            start_seconds,
+            subtitle_url,
+        }))
+        .await
     }
 
     pub async fn seek(&self, seconds: f64) -> Result<()> {
@@ -510,6 +535,11 @@ async fn run_actor(
     let mut lines = BufReader::new(reader).lines();
     let mut next_request_id = 10_000_u64;
     let mut pending_overlay_commands = HashMap::new();
+    let mut pending_load = Some(LoadRequest {
+        url,
+        start_seconds,
+        subtitle_url,
+    });
     let mut needs_initial_activation = bring_to_front_on_start;
 
     send_json(
@@ -518,9 +548,16 @@ async fn run_actor(
     )
     .await?;
     set_window_state(&mut writer, &window_title, window_state).await?;
-    for (number, property) in ["time-pos", "pause", "mute", "volume", "track-list"]
-        .iter()
-        .enumerate()
+    for (number, property) in [
+        "time-pos",
+        "pause",
+        "paused-for-cache",
+        "mute",
+        "volume",
+        "track-list",
+    ]
+    .iter()
+    .enumerate()
     {
         send_json(
             &mut writer,
@@ -528,9 +565,9 @@ async fn run_actor(
         )
         .await?;
     }
-    send_json(
+    send_load_file(
         &mut writer,
-        json!({"command": ["loadfile", url.as_str(), "replace"]}),
+        pending_load.as_ref().expect("初始加载请求已准备"),
     )
     .await?;
     if let Some(startup) = startup.take() {
@@ -545,6 +582,14 @@ async fn run_actor(
                     break;
                 };
                 match command {
+                    MpvCommand::LoadFile(load) => {
+                        pending_load = Some(load);
+                        send_load_file(
+                            &mut writer,
+                            pending_load.as_ref().expect("待加载请求已准备"),
+                        )
+                        .await?;
+                    }
                     MpvCommand::AddOverlay { overlay, completed } => {
                         let request_id = next_request_id;
                         next_request_id = next_request_id.wrapping_add(1);
@@ -580,17 +625,19 @@ async fn run_actor(
                                 bring_mpv_window_to_front(child.id());
                                 needs_initial_activation = false;
                             }
-                            if start_seconds > 0.0 {
-                                send_json(
-                                    &mut writer,
-                                    json!({"command": ["seek", start_seconds, "absolute", "exact"]}),
-                                ).await?;
-                            }
-                            if let Some(subtitle_url) = subtitle_url.as_ref() {
-                                send_json(
-                                    &mut writer,
-                                    json!({"command": ["sub-add", subtitle_url.as_str(), "select"]}),
-                                ).await?;
+                            if let Some(load) = pending_load.take() {
+                                if load.start_seconds > 0.0 {
+                                    send_json(
+                                        &mut writer,
+                                        json!({"command": ["seek", load.start_seconds, "absolute", "exact"]}),
+                                    ).await?;
+                                }
+                                if let Some(subtitle_url) = load.subtitle_url.as_ref() {
+                                    send_json(
+                                        &mut writer,
+                                        json!({"command": ["sub-add", subtitle_url.as_str(), "select"]}),
+                                    ).await?;
+                                }
                             }
                             if let Some((width, height)) = thumbnail_size {
                                 configure_thumbnail_script(&mut writer, width, height).await?;
@@ -602,7 +649,9 @@ async fn run_actor(
                             emit_client_message(id, &value, &events).await;
                         } else if value.get("event").and_then(Value::as_str) == Some("end-file") {
                             let failed = value.get("reason").and_then(Value::as_str) == Some("error");
-                            let _ = events.send(MpvEvent::Ended { id, failed }).await;
+                            if failed || pending_load.is_none() {
+                                let _ = events.send(MpvEvent::Ended { id, failed }).await;
+                            }
                         } else if value.get("event").and_then(Value::as_str) == Some("shutdown") {
                             break;
                         }
@@ -693,6 +742,14 @@ async fn configure_thumbnail_script<W: AsyncWrite + Unpin>(
     .await
 }
 
+async fn send_load_file<W: AsyncWrite + Unpin>(writer: &mut W, load: &LoadRequest) -> Result<()> {
+    send_json(
+        writer,
+        json!({"command": ["loadfile", load.url.as_str(), "replace"]}),
+    )
+    .await
+}
+
 async fn set_window_state<W: AsyncWrite + Unpin>(
     writer: &mut W,
     title: &str,
@@ -746,7 +803,7 @@ async fn send_mpv_command<W: AsyncWrite + Unpin>(
             json!({"command": ["sub-add", url, "select"]})
         }
         MpvCommand::DisableSubtitle => json!({"command": ["set_property", "sid", "no"]}),
-        MpvCommand::AddOverlay { .. } | MpvCommand::RemoveOverlay(_) => {
+        MpvCommand::LoadFile(_) | MpvCommand::AddOverlay { .. } | MpvCommand::RemoveOverlay(_) => {
             unreachable!("覆盖层命令由 mpv actor 单独处理")
         }
         MpvCommand::Quit => json!({"command": ["quit"]}),
@@ -771,6 +828,9 @@ async fn emit_property(id: Uuid, value: &Value, events: &mpsc::Sender<MpvEvent>)
             .as_f64()
             .map(|seconds| MpvEvent::Position { id, seconds }),
         Some("pause") => data.as_bool().map(|paused| MpvEvent::Paused { id, paused }),
+        Some("paused-for-cache") => data
+            .as_bool()
+            .map(|buffering| MpvEvent::Buffering { id, buffering }),
         Some("mute") => data.as_bool().map(|muted| MpvEvent::Muted { id, muted }),
         Some("volume") => data.as_f64().map(|volume| MpvEvent::Volume { id, volume }),
         Some("track-list") => {
@@ -1153,6 +1213,46 @@ mod tests {
         assert_eq!(audio_track_ids.get(&1), Some(&2));
         assert_eq!(audio_track_ids.get(&3), Some(&4));
         assert!(!audio_track_ids.contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn parses_cache_buffering_property() {
+        let (events, mut receiver) = mpsc::channel(1);
+        let id = Uuid::new_v4();
+        emit_property(
+            id,
+            &json!({"name": "paused-for-cache", "data": true}),
+            &events,
+        )
+        .await;
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(MpvEvent::Buffering {
+                id: event_id,
+                buffering: true
+            }) if event_id == id
+        ));
+    }
+
+    #[tokio::test]
+    async fn emits_replace_load_file_command() {
+        let (mut writer, mut reader) = duplex(1024);
+        let load = LoadRequest {
+            url: Url::parse("https://example.test/video.m3u8").unwrap(),
+            start_seconds: 12.5,
+            subtitle_url: None,
+        };
+        send_load_file(&mut writer, &load).await.unwrap();
+        drop(writer);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        let message: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(
+            message["command"],
+            json!(["loadfile", "https://example.test/video.m3u8", "replace"])
+        );
     }
 
     #[tokio::test]
