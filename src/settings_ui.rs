@@ -57,7 +57,6 @@ mod platform {
     const ID_COMMERCIAL: usize = 1205;
     const ID_BRING_TO_FRONT_ON_START: usize = 1301;
     const ID_PLAYBACK_MODE: usize = 1302;
-    const ID_AUTO_ADJUST_BITRATE: usize = 1303;
     const ID_SAVE: usize = 1;
     const ID_CANCEL: usize = 2;
     const BST_UNCHECKED: u32 = 0;
@@ -75,7 +74,6 @@ mod platform {
         commercial: HWND,
         bring_to_front_on_start: HWND,
         playback_mode: HWND,
-        auto_adjust_bitrate: HWND,
     }
 
     impl SettingsState {
@@ -92,7 +90,6 @@ mod platform {
                 commercial: null_mut(),
                 bring_to_front_on_start: null_mut(),
                 playback_mode: null_mut(),
-                auto_adjust_bitrate: null_mut(),
             }
         }
     }
@@ -119,7 +116,7 @@ mod platform {
             let state_ptr = Box::into_raw(state);
             let title = wide("Jellyfin MPV 设置");
             let width = 520;
-            let height = 580;
+            let height = 540;
             let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
             let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
             let hwnd = CreateWindowExW(
@@ -332,27 +329,13 @@ mod platform {
                 font,
             )
         }?;
-        unsafe { create_label(hwnd, instance, "缓冲时码率", 24, 420, 88, 22, font) }?;
-        state.auto_adjust_bitrate = unsafe {
-            create_adaptive_bitrate_selector(
-                hwnd,
-                instance,
-                ID_AUTO_ADJUST_BITRATE,
-                settings.auto_adjust_bitrate,
-                118,
-                416,
-                220,
-                font,
-            )
-        }?;
-
         unsafe {
             create_label(
                 hwnd,
                 instance,
-                "服务器或登录信息变化时，当前播放会停止并重新连接；码率选项立即生效。",
+                "服务器或登录信息变化时，当前播放会停止并重新连接。",
                 24,
-                460,
+                420,
                 464,
                 22,
                 font,
@@ -365,7 +348,7 @@ mod platform {
                 ID_SAVE,
                 "保存",
                 304,
-                496,
+                456,
                 BS_DEFPUSHBUTTON as u32,
                 font,
             )
@@ -377,7 +360,7 @@ mod platform {
                 ID_CANCEL,
                 "取消",
                 408,
-                496,
+                456,
                 BS_PUSHBUTTON as u32,
                 font,
             )
@@ -520,49 +503,6 @@ mod platform {
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn create_adaptive_bitrate_selector(
-        parent: HWND,
-        instance: HINSTANCE,
-        id: usize,
-        selected_auto_adjust: bool,
-        x: i32,
-        y: i32,
-        width: i32,
-        font: *mut core::ffi::c_void,
-    ) -> Result<HWND> {
-        let selector = unsafe {
-            create_control(
-                parent,
-                instance,
-                "COMBOBOX",
-                "",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | CBS_DROPDOWNLIST as u32,
-                x,
-                y,
-                width,
-                160,
-                id,
-                font,
-            )
-        }?;
-        for label in ["自动调整", "不自动调整"] {
-            let label = wide(label);
-            unsafe {
-                SendMessageW(selector, CB_ADDSTRING, 0, label.as_ptr() as LPARAM);
-            }
-        }
-        unsafe {
-            SendMessageW(
-                selector,
-                CB_SETCURSEL,
-                if selected_auto_adjust { 0 } else { 1 },
-                0,
-            );
-        }
-        Ok(selector)
-    }
-
-    #[allow(clippy::too_many_arguments)]
     unsafe fn create_button(
         parent: HWND,
         instance: HINSTANCE,
@@ -686,7 +626,7 @@ mod platform {
         let settings = SkipSettings {
             bring_to_front_on_start: unsafe { is_checked(state.bring_to_front_on_start) },
             playback_mode: unsafe { selected_playback_mode(state.playback_mode) },
-            auto_adjust_bitrate: unsafe { selected_auto_adjust_bitrate(state.auto_adjust_bitrate) },
+            auto_adjust_bitrate: state.context.skip_settings.snapshot().auto_adjust_bitrate,
             intro: unsafe { is_checked(state.intro) },
             outro: unsafe { is_checked(state.outro) },
             recap: unsafe { is_checked(state.recap) },
@@ -716,9 +656,9 @@ mod platform {
         let connection_changed = login != previous;
 
         let text = wide(if connection_changed {
-            "设置已保存，正在重新连接 Jellyfin。播放窗口选项将在下次播放时生效，码率选项立即生效。"
+            "设置已保存，正在重新连接 Jellyfin。播放窗口选项将在下次播放时生效。"
         } else {
-            "设置已保存。播放窗口选项将在下次播放时生效，码率选项立即生效。"
+            "设置已保存。播放窗口选项将在下次播放时生效。"
         });
         let title = wide("Jellyfin MPV 设置");
         unsafe {
@@ -753,10 +693,6 @@ mod platform {
             2 => PlaybackMode::Fullscreen,
             _ => PlaybackMode::Maximized,
         }
-    }
-
-    unsafe fn selected_auto_adjust_bitrate(hwnd: HWND) -> bool {
-        unsafe { SendMessageW(hwnd, CB_GETCURSEL, 0, 0) as i32 == 0 }
     }
 
     unsafe fn control_text(hwnd: HWND) -> String {

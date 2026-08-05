@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     jellyfin::JellyfinClient,
-    mpv::{MpvEvent, MpvHandle, MpvLaunch, spawn_mpv},
+    mpv::{MpvBitrateSelection, MpvEvent, MpvHandle, MpvLaunch, spawn_mpv},
     protocol::{
         MediaSegment, MediaSource, MediaStream, PlayRequest, PlaybackReport, PlaybackStopReport,
         RemoteCommand,
@@ -365,6 +365,7 @@ impl Player {
             start_seconds: start_ticks as f64 / 10_000_000.0,
             subtitle_url,
             thumbnail_size: trickplay.as_ref().map(|profile| profile.display_size()),
+            bitrate_selection: bitrate_menu_selection(playback_settings.auto_adjust_bitrate, None),
             events: self.mpv_events.clone(),
         })
         .await
@@ -516,6 +517,7 @@ impl Player {
             | MpvEvent::Volume { id, .. }
             | MpvEvent::AudioTracks { id, .. }
             | MpvEvent::Preview { id, .. }
+            | MpvEvent::BitrateSelection { id, .. }
             | MpvEvent::Ended { id, .. }
             | MpvEvent::Terminated { id, .. } => *id,
         };
@@ -591,6 +593,9 @@ impl Player {
                     thumbnail.request(request);
                 }
             }
+            MpvEvent::BitrateSelection { selection, .. } => {
+                self.select_bitrate(selection).await?;
+            }
             MpvEvent::Ended { failed, .. } | MpvEvent::Terminated { failed, .. } => {
                 self.stop_current(failed).await;
             }
@@ -630,6 +635,106 @@ impl Player {
         );
         self.report_progress().await;
         Ok(())
+    }
+
+    async fn select_bitrate(&mut self, selection: MpvBitrateSelection) -> Result<()> {
+        let max_streaming_bitrate = selection.max_streaming_bitrate();
+        let previous_settings = self.skip_settings.snapshot();
+        let (previous_selection, mpv, needs_switch) = self
+            .playback
+            .as_ref()
+            .map(|playback| {
+                (
+                    bitrate_menu_selection(
+                        previous_settings.auto_adjust_bitrate,
+                        playback.max_streaming_bitrate,
+                    ),
+                    Some(playback.mpv.clone()),
+                    playback.max_streaming_bitrate != max_streaming_bitrate,
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    bitrate_menu_selection(previous_settings.auto_adjust_bitrate, None),
+                    None,
+                    false,
+                )
+            });
+        let settings_changed =
+            previous_settings.auto_adjust_bitrate != selection.enables_auto_adjustment();
+        if settings_changed {
+            let mut settings = previous_settings.clone();
+            settings.auto_adjust_bitrate = selection.enables_auto_adjustment();
+            if let Err(error) = self.skip_settings.update(settings) {
+                if let Some(mpv) = mpv.as_ref()
+                    && let Err(restore_error) = mpv.set_bitrate_selection(previous_selection).await
+                {
+                    warn!(%restore_error, "恢复 mpv 码率菜单状态失败");
+                }
+                return Err(error);
+            }
+        }
+
+        let result = if needs_switch {
+            self.switch_bitrate(max_streaming_bitrate).await
+        } else {
+            Ok(true)
+        };
+        match result {
+            Ok(true) => {
+                let now = Instant::now();
+                if let Some(playback) = self.playback.as_mut() {
+                    playback.buffering_since = None;
+                    playback.stable_since = Some(now);
+                    playback.last_bitrate_switch = Some(now);
+                }
+                if let Some(mpv) = mpv
+                    && let Err(error) = mpv.set_bitrate_selection(selection).await
+                {
+                    warn!(%error, "更新 mpv 码率菜单状态失败");
+                }
+                info!(quality = %selection.label(), "已从 mpv 码率菜单切换播放质量");
+                Ok(())
+            }
+            Ok(false) => {
+                self.restore_bitrate_menu_selection(
+                    previous_settings,
+                    settings_changed,
+                    previous_selection,
+                    mpv,
+                )
+                .await;
+                warn!(quality = %selection.label(), "当前媒体无法切换码率");
+                Ok(())
+            }
+            Err(error) => {
+                self.restore_bitrate_menu_selection(
+                    previous_settings,
+                    settings_changed,
+                    previous_selection,
+                    mpv,
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn restore_bitrate_menu_selection(
+        &self,
+        previous_settings: SkipSettings,
+        settings_changed: bool,
+        selection: MpvBitrateSelection,
+        mpv: Option<MpvHandle>,
+    ) {
+        if settings_changed && let Err(error) = self.skip_settings.update(previous_settings) {
+            warn!(%error, "恢复自动调整码率设置失败");
+        }
+        if let Some(mpv) = mpv
+            && let Err(error) = mpv.set_bitrate_selection(selection).await
+        {
+            warn!(%error, "恢复 mpv 码率菜单状态失败");
+        }
     }
 
     async fn check_adaptive_bitrate(&mut self) -> Result<()> {
@@ -693,12 +798,19 @@ impl Player {
                 if let Some(playback) = self.playback.as_mut() {
                     playback.last_bitrate_switch = Some(now);
                 }
-                let switched = self.switch_bitrate(max_streaming_bitrate, recovery).await?;
+                let switched = self.switch_bitrate(max_streaming_bitrate).await?;
                 if let Some(playback) = self.playback.as_mut() {
                     if switched {
                         if recovery {
+                            match max_streaming_bitrate {
+                                Some(value) => info!(bitrate_bps = value, "稳定播放后恢复较高码率"),
+                                None => info!("稳定播放后恢复原始最高码率"),
+                            }
                             playback.stable_since = Some(now);
                         } else {
+                            if let Some(value) = max_streaming_bitrate {
+                                info!(bitrate_bps = value, "检测到持续缓冲，已降低码率");
+                            }
                             playback.buffering_since = Some(now);
                             playback.stable_since = None;
                         }
@@ -720,11 +832,7 @@ impl Player {
         Ok(())
     }
 
-    async fn switch_bitrate(
-        &mut self,
-        max_streaming_bitrate: Option<u64>,
-        recovery: bool,
-    ) -> Result<bool> {
+    async fn switch_bitrate(&mut self, max_streaming_bitrate: Option<u64>) -> Result<bool> {
         let (
             item_id,
             media_type,
@@ -821,14 +929,6 @@ impl Player {
         playback.source_bitrate = source_bitrate.or(new_source_bitrate);
         playback.max_streaming_bitrate = max_streaming_bitrate;
 
-        if recovery {
-            match max_streaming_bitrate {
-                Some(value) => info!(bitrate_bps = value, "稳定播放后恢复较高码率"),
-                None => info!("稳定播放后恢复原始最高码率"),
-            }
-        } else if let Some(value) = max_streaming_bitrate {
-            info!(bitrate_bps = value, "检测到持续缓冲，已降低码率");
-        }
         self.report_progress().await;
         Ok(true)
     }
@@ -911,6 +1011,19 @@ fn media_source_bitrate(source: &MediaSource) -> Option<u64> {
         .bitrate
         .and_then(|bitrate| u64::try_from(bitrate).ok())
         .filter(|bitrate| *bitrate > 0)
+}
+
+fn bitrate_menu_selection(
+    auto_adjust_bitrate: bool,
+    max_streaming_bitrate: Option<u64>,
+) -> MpvBitrateSelection {
+    if auto_adjust_bitrate {
+        MpvBitrateSelection::Adaptive
+    } else {
+        max_streaming_bitrate
+            .map(MpvBitrateSelection::Limit)
+            .unwrap_or(MpvBitrateSelection::Auto)
+    }
 }
 
 fn next_lower_bitrate(current: Option<u64>, source_bitrate: Option<u64>) -> Option<u64> {
@@ -1069,6 +1182,22 @@ mod tests {
         assert_eq!(
             next_skip_target(&mut segments, 150, &settings),
             Some(("Recap".to_owned(), 200))
+        );
+    }
+
+    #[test]
+    fn derives_f9_menu_selection_from_current_bitrate_mode() {
+        assert_eq!(
+            bitrate_menu_selection(true, Some(4_000_000)),
+            MpvBitrateSelection::Adaptive
+        );
+        assert_eq!(
+            bitrate_menu_selection(false, None),
+            MpvBitrateSelection::Auto
+        );
+        assert_eq!(
+            bitrate_menu_selection(false, Some(4_000_000)),
+            MpvBitrateSelection::Limit(4_000_000)
         );
     }
 

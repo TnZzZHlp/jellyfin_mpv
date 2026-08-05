@@ -253,6 +253,8 @@ impl JellyfinClient {
         subtitle_index: Option<i32>,
         max_streaming_bitrate: Option<u64>,
     ) -> Result<PlaybackInfoResponse> {
+        let max_streaming_bitrate =
+            max_streaming_bitrate.map(|value| value.min(MAX_JELLYFIN_STREAMING_BITRATE as u64));
         let mut url = self.endpoint(&["Items", item_id, "PlaybackInfo"])?;
         {
             let mut query = url.query_pairs_mut();
@@ -270,6 +272,9 @@ impl JellyfinClient {
             }
             if let Some(index) = subtitle_index {
                 query.append_pair("subtitleStreamIndex", &index.to_string());
+            }
+            if let Some(bitrate) = max_streaming_bitrate {
+                query.append_pair("maxStreamingBitrate", &bitrate.to_string());
             }
         }
 
@@ -988,7 +993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_an_int32_compatible_default_playback_profile() {
+    async fn sends_selected_bitrate_in_playback_info_query_and_profile() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1026,25 +1031,25 @@ mod tests {
         let (client, _) = JellyfinClient::connect(config).await.unwrap();
 
         let info = client
-            .playback_info("user-1", "item-1", 0, None, None, None, None)
+            .playback_info("user-1", "item-1", 0, None, None, None, Some(8_000_000))
             .await
             .unwrap();
         assert!(info.media_sources.is_empty());
 
         let playback_request = server.await.unwrap();
+        assert!(playback_request.starts_with(
+            "POST /Items/item-1/PlaybackInfo?userId=user-1&startTimeTicks=0&autoOpenLiveStream=true&enableDirectPlay=true&enableDirectStream=true&enableTranscoding=true&maxStreamingBitrate=8000000 "
+        ));
         let (_, body) = playback_request.split_once("\r\n\r\n").unwrap();
         let profile: Value = serde_json::from_str(body).unwrap();
-        assert_eq!(
-            profile["MaxStreamingBitrate"],
-            json!(MAX_JELLYFIN_STREAMING_BITRATE)
-        );
+        assert_eq!(profile["MaxStreamingBitrate"], json!(8_000_000));
         assert_eq!(
             profile["DeviceProfile"]["MaxStreamingBitrate"],
-            json!(MAX_JELLYFIN_STREAMING_BITRATE)
+            json!(8_000_000)
         );
         assert_eq!(
             profile["DeviceProfile"]["MaxStaticBitrate"],
-            json!(MAX_JELLYFIN_STREAMING_BITRATE)
+            json!(8_000_000)
         );
     }
 
