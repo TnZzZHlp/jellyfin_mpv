@@ -56,6 +56,7 @@ local function remove_menu_bindings()
     mp.remove_key_binding("jellyfin-mpv-bitrate-up")
     mp.remove_key_binding("jellyfin-mpv-bitrate-down")
     mp.remove_key_binding("jellyfin-mpv-bitrate-apply")
+    mp.remove_key_binding("jellyfin-mpv-bitrate-apply-numpad")
     mp.remove_key_binding("jellyfin-mpv-bitrate-close")
 end
 
@@ -89,6 +90,7 @@ local function open_menu()
         move_selection(1)
     end, { repeatable = true })
     mp.add_forced_key_binding("ENTER", "jellyfin-mpv-bitrate-apply", apply_selection)
+    mp.add_forced_key_binding("KP_ENTER", "jellyfin-mpv-bitrate-apply-numpad", apply_selection)
     mp.add_forced_key_binding("ESC", "jellyfin-mpv-bitrate-close", close_menu)
     render()
 end
