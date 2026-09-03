@@ -75,7 +75,9 @@ mod platform {
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let thread = thread::Builder::new()
                 .name("jellyfin-mpv-tray".to_owned())
-                .spawn(move || run_message_loop(shutdown, tooltip, log_path, settings, ready_tx))
+                .spawn(move || {
+                    run_message_loop(shutdown, &tooltip, log_path, settings, &ready_tx);
+                })
                 .context("创建托盘消息线程失败")?;
             let hwnd = ready_rx
                 .recv_timeout(Duration::from_secs(5))
@@ -119,19 +121,19 @@ mod platform {
 
     fn run_message_loop(
         shutdown: CancellationToken,
-        tooltip: String,
+        tooltip: &str,
         log_path: PathBuf,
         settings: SettingsContext,
-        ready: mpsc::SyncSender<Result<isize, String>>,
+        ready: &mpsc::SyncSender<Result<isize, String>>,
     ) {
-        match unsafe { create_tray_window(shutdown, &tooltip, log_path, settings) } {
+        match unsafe { create_tray_window(shutdown, tooltip, log_path, settings) } {
             Ok(hwnd) => {
                 let _ = ready.send(Ok(hwnd as isize));
                 unsafe {
                     let mut message: MSG = std::mem::zeroed();
-                    while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
-                        TranslateMessage(&message);
-                        DispatchMessageW(&message);
+                    while GetMessageW(&raw mut message, null_mut(), 0, 0) > 0 {
+                        TranslateMessage(&raw const message);
+                        DispatchMessageW(&raw const message);
                     }
                 }
             }
@@ -158,7 +160,7 @@ mod platform {
             lpszClassName: class_name.as_ptr(),
             ..unsafe { std::mem::zeroed() }
         };
-        unsafe { RegisterClassW(&window_class) };
+        unsafe { RegisterClassW(&raw const window_class) };
 
         let menu = unsafe { CreatePopupMenu() };
         if menu.is_null() {
@@ -212,14 +214,15 @@ mod platform {
         }
 
         let mut icon: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
-        icon.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        icon.cbSize =
+            u32::try_from(size_of::<NOTIFYICONDATAW>()).expect("NOTIFYICONDATAW size fits in u32");
         icon.hWnd = hwnd;
         icon.uID = ICON_ID;
         icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         icon.uCallbackMessage = WM_TRAY;
         icon.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
         copy_wide(&mut icon.szTip, tooltip);
-        if unsafe { Shell_NotifyIconW(NIM_ADD, &icon) } == 0 {
+        if unsafe { Shell_NotifyIconW(NIM_ADD, &raw const icon) } == 0 {
             unsafe { DestroyWindow(hwnd) };
             bail!("向 Windows 通知区域添加图标失败");
         }
@@ -235,14 +238,16 @@ mod platform {
     ) -> LRESULT {
         if message == WM_NCCREATE {
             let create = lparam as *const CREATESTRUCTW;
-            let state = unsafe { (*create).lpCreateParams as *mut TrayState };
+            let state = unsafe { (*create).lpCreateParams.cast::<TrayState>() };
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
             return 1;
         }
 
         let state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState };
+        let is_tray_click = u32::try_from(lparam)
+            .is_ok_and(|message| matches!(message, WM_RBUTTONUP | WM_LBUTTONUP));
         match message {
-            WM_TRAY if lparam as u32 == WM_RBUTTONUP || lparam as u32 == WM_LBUTTONUP => {
+            WM_TRAY if is_tray_click => {
                 if !state.is_null() {
                     unsafe { show_menu(hwnd, (*state).menu as _) };
                 }
@@ -310,7 +315,7 @@ mod platform {
     unsafe fn show_menu(hwnd: HWND, menu: isize) {
         let mut point = POINT { x: 0, y: 0 };
         unsafe {
-            GetCursorPos(&mut point);
+            GetCursorPos(&raw mut point);
             SetForegroundWindow(hwnd);
             TrackPopupMenu(
                 menu as _,
@@ -327,11 +332,12 @@ mod platform {
 
     fn remove_icon(hwnd: HWND) {
         let mut icon: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
-        icon.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        icon.cbSize =
+            u32::try_from(size_of::<NOTIFYICONDATAW>()).expect("NOTIFYICONDATAW size fits in u32");
         icon.hWnd = hwnd;
         icon.uID = ICON_ID;
         unsafe {
-            Shell_NotifyIconW(NIM_DELETE, &icon);
+            Shell_NotifyIconW(NIM_DELETE, &raw const icon);
         }
     }
 
@@ -473,6 +479,7 @@ pub struct TrayIcon;
 
 #[cfg(not(windows))]
 impl TrayIcon {
+    #[allow(clippy::unnecessary_wraps)]
     pub fn start(
         _shutdown: tokio_util::sync::CancellationToken,
         _tooltip: String,
@@ -482,5 +489,6 @@ impl TrayIcon {
         Ok(Self)
     }
 
-    pub fn close(self) {}
+    #[allow(clippy::unused_self)]
+    pub const fn close(self) {}
 }

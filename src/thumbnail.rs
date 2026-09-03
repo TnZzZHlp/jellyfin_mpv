@@ -30,7 +30,7 @@ pub struct TrickplayProfile {
 }
 
 impl TrickplayProfile {
-    pub fn display_size(&self) -> (u32, u32) {
+    pub const fn display_size(&self) -> (u32, u32) {
         (self.info.width, self.info.height)
     }
 }
@@ -66,7 +66,7 @@ pub fn select_trickplay(item: &ItemDto, media_source_id: &str) -> Option<Trickpl
     })
 }
 
-fn valid_info(info: &TrickplayInfo) -> bool {
+const fn valid_info(info: &TrickplayInfo) -> bool {
     info.width > 0
         && info.height > 0
         && info.tile_width > 0
@@ -174,7 +174,7 @@ impl TileStore {
     }
 
     fn tile_count(&self) -> u32 {
-        self.entries.len() as u32
+        u32::try_from(self.entries.len()).expect("tile count originated from u32")
     }
 
     async fn ensure_cached(&self, index: u32) -> Result<Option<PathBuf>> {
@@ -287,7 +287,7 @@ async fn run_worker(
                     if changed.is_err() {
                         break 'worker;
                     }
-                    request = receiver.borrow_and_update().clone();
+                    request.clone_from(&receiver.borrow_and_update());
                 }
                 result = render_preview(
                     &store, &mpv, current, &output, &mut cache,
@@ -369,16 +369,26 @@ struct FrameLocation {
     row: u32,
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn frame_index(seconds: f64, interval: u64) -> u64 {
+    (seconds.max(0.0) * 1000.0 / interval as f64).floor() as u64
+}
+
 fn frame_location(info: &TrickplayInfo, seconds: f64) -> Result<FrameLocation> {
     if !valid_info(info) {
         bail!("Trickplay 元数据无效");
     }
     let raw_frame = if seconds.is_finite() {
-        (seconds.max(0.0) * 1000.0 / info.interval as f64).floor() as u64
+        frame_index(seconds, info.interval)
     } else {
         0
     };
-    let frame = raw_frame.min(u64::from(info.thumbnail_count - 1)) as u32;
+    let frame = u32::try_from(raw_frame.min(u64::from(info.thumbnail_count - 1)))
+        .expect("frame index is bounded by thumbnail count");
     let per_tile = info
         .tile_width
         .checked_mul(info.tile_height)
@@ -434,14 +444,19 @@ fn crop_bgra(tile: &RgbImage, info: &TrickplayInfo, location: FrameLocation) -> 
     Ok(output)
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+const fn rounded_dimension(value: f64) -> u32 {
+    value.round().max(1.0) as u32
+}
+
 fn fit_destination(request: &MpvPreviewRequest, info: &TrickplayInfo) -> (i64, i64, u32, u32) {
     if request.width == 0 || request.height == 0 {
         return (request.x, request.y, info.width, info.height);
     }
-    let scale =
-        (request.width as f64 / info.width as f64).min(request.height as f64 / info.height as f64);
-    let width = (info.width as f64 * scale).round().max(1.0) as u32;
-    let height = (info.height as f64 * scale).round().max(1.0) as u32;
+    let scale = (f64::from(request.width) / f64::from(info.width))
+        .min(f64::from(request.height) / f64::from(info.height));
+    let width = rounded_dimension(f64::from(info.width) * scale);
+    let height = rounded_dimension(f64::from(info.height) * scale);
     let x = request.x + i64::from(request.width.saturating_sub(width) / 2);
     let y = request.y + i64::from(request.height.saturating_sub(height) / 2);
     (x, y, width, height)

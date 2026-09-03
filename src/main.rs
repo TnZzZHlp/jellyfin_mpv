@@ -59,6 +59,7 @@ async fn main() {
     }
 }
 
+#[cfg_attr(windows, allow(clippy::future_not_send))]
 async fn run() -> Result<()> {
     let log_path = init_logging()?;
     info!(path = %log_path.display(), "日志系统已启动");
@@ -85,7 +86,7 @@ async fn run() -> Result<()> {
                     "连接 Jellyfin 失败，将继续使用现有登录信息重试"
                 );
                 tokio::select! {
-                    _ = sleep(initial_retry_delay) => {
+                    () = sleep(initial_retry_delay) => {
                         initial_retry_delay = (initial_retry_delay + initial_retry_delay)
                             .min(MAX_RETRY_DELAY);
                     }
@@ -234,9 +235,7 @@ async fn run() -> Result<()> {
 }
 
 fn init_logging() -> Result<PathBuf> {
-    let base = env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
+    let base = env::var_os("LOCALAPPDATA").map_or_else(env::temp_dir, PathBuf::from);
     let log_directory = base.join("jellyfin_mpv");
     fs::create_dir_all(&log_directory).context("创建日志目录失败")?;
     let log_path = log_directory.join("jellyfin_mpv.log");

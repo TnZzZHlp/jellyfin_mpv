@@ -11,12 +11,23 @@ cargo run --release
 
 Requires `mpv` in PATH or set via `--mpv-path`.
 
-## Tests
+## Required Validation
 
-Tests are inline in source files under `src/`. Run with:
+Tests are inline in source files under `src/`. Before considering any source change complete, run:
 
 ```powershell
+cargo fmt --all
+cargo lint
 cargo test
+```
+
+`cargo lint` is mandatory. It must finish with no warnings or errors; fix every diagnostic before completion and inspect any automatic fixes it applies. The repository does not define this Cargo alias, so do not silently skip the check if the active environment lacks it.
+
+For changes touching Windows-only code, also verify the MinGW target when working from another host:
+
+```powershell
+cargo +stable clippy --target x86_64-pc-windows-gnu --all-targets --all-features
+cargo +stable test --target x86_64-pc-windows-gnu --all-features --no-run
 ```
 
 ## Toolchain
@@ -30,16 +41,29 @@ scoop install gcc
 
 ## Key Architecture
 
-- `main.rs`: Entry point, single-instance check, tray icon, connection loop
-- `jellyfin.rs`: HTTP/WebSocket client, authentication, media info, progress reporting
-- `player.rs`: Playback state machine, mpv IPC, media segment skipping
-- `mpv.rs`: mpv process spawning and JSON IPC protocol
-- `protocol.rs`: Jellyfin API types and WebSocket message parsing
-- `config.rs`: CLI args and environment variable handling
-- `tray.rs`: Windows system tray icon and menu
-- `login_ui.rs` / `settings_ui.rs`: Windows dialogs
-- `credential_store.rs`: Windows Credential Manager for saved logins
-- `skip_settings.rs`: Media segment skip preferences
+- `src/main.rs`: Entry point, single-instance check, tray icon, and connection loop
+- `src/jellyfin.rs`: HTTP/WebSocket client, authentication, media info, and progress reporting
+- `src/player.rs`: Playback state machine, mpv IPC, bitrate adaptation, and media segment skipping
+- `src/mpv.rs`: mpv process spawning and JSON IPC protocol
+- `src/protocol.rs`: Jellyfin API types and WebSocket message parsing
+- `src/config.rs`: CLI args and environment variable handling
+- `src/tray.rs`: Windows system tray icon and menu
+- `src/login_ui.rs` / `src/settings_ui.rs`: Windows dialogs
+- `src/credential_store.rs`: Windows Credential Manager for saved logins
+- `src/skip_settings.rs`: Persisted playback and media segment preferences
+- `src/thumbnail.rs`: Jellyfin Trickplay selection, caching, and mpv overlays
+- `src/quality_menu.lua` / `src/thumbfast.lua`: Embedded mpv-side bridge scripts
+- `src/single_instance.rs`: Windows single-instance guard
+- `README.md`: User-facing behavior, setup, and operational documentation
+
+## Coding Conventions and Constraints
+
+- Use Rust 2024 and existing Tokio async patterns; use `anyhow` for contextual errors and `tracing` for logs.
+- Keep tests beside the implementation in `#[cfg(test)]` modules and add focused regression coverage for non-trivial behavior changes.
+- Preserve `#[cfg(windows)]` Win32 implementations and their non-Windows fallbacks; lint the affected platform rather than assuming a host-only check covers both.
+- Match existing Chinese user-facing messages and logs.
+- Treat passwords, access tokens, and authenticated headers as secrets. Never place them in logs, URLs, fixtures, or documentation.
+- Do not use emoji anywhere in the repository, including code, comments, tests, documentation, configuration, or commit messages.
 
 ## CLI / Environment
 

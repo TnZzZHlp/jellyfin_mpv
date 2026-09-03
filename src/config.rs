@@ -62,7 +62,7 @@ impl ConfigArgs {
     pub fn resolve(self) -> Result<Option<Config>> {
         let mut server = self.server;
         let mut username = normalize_username(self.username);
-        let mut password = self.password.map(decode_password).transpose()?;
+        let mut password = self.password.as_deref().map(decode_password).transpose()?;
         let mut persist_login = false;
         let has_explicit_login = server.is_some() || username.is_some() || password.is_some();
 
@@ -232,7 +232,7 @@ fn normalize_username(username: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn decode_password(encoded_password: String) -> Result<String> {
+fn decode_password(encoded_password: &str) -> Result<String> {
     if encoded_password.trim().is_empty() {
         bail!("请通过 --password 提供 Base64 编码的 Jellyfin 密码");
     }

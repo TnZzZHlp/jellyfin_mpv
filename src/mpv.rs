@@ -24,6 +24,9 @@ trait AsyncIpc: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncIpc for T {}
 type IpcStream = Box<dyn AsyncIpc>;
 
+const IPC_CONNECT_ATTEMPTS: usize = 500;
+const IPC_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
 #[cfg(windows)]
 fn bring_mpv_window_to_front(process_id: Option<u32>) {
     const WINDOW_DISCOVERY_RETRIES: usize = 10;
@@ -59,7 +62,7 @@ fn bring_mpv_window_to_front(process_id: Option<u32>) {
 }
 
 #[cfg(not(windows))]
-fn bring_mpv_window_to_front(_process_id: Option<u32>) {}
+const fn bring_mpv_window_to_front(_process_id: Option<u32>) {}
 
 #[cfg(windows)]
 mod window_activation {
@@ -91,10 +94,7 @@ mod window_activation {
             hwnd: std::ptr::null_mut(),
         };
         unsafe {
-            EnumWindows(
-                Some(find_window_for_process),
-                (&mut search as *mut WindowSearch) as LPARAM,
-            );
+            EnumWindows(Some(find_window_for_process), (&raw mut search) as LPARAM);
         }
 
         if search.hwnd.is_null() {
@@ -123,7 +123,7 @@ mod window_activation {
             };
             let current_thread = GetCurrentThreadId();
             let mut message = MSG::default();
-            PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+            PeekMessageW(&raw mut message, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
             let input_attached = foreground_thread != 0
                 && foreground_thread != current_thread
                 && AttachThreadInput(current_thread, foreground_thread, 1) != 0;
@@ -147,7 +147,7 @@ mod window_activation {
     unsafe extern "system" fn find_window_for_process(hwnd: HWND, lparam: LPARAM) -> i32 {
         let search = unsafe { &mut *(lparam as *mut WindowSearch) };
         let mut process_id = 0;
-        unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+        unsafe { GetWindowThreadProcessId(hwnd, &raw mut process_id) };
         if process_id != search.process_id || unsafe { IsWindowVisible(hwnd) } == 0 {
             return 1;
         }
@@ -235,7 +235,10 @@ impl MpvBitrateSelection {
         match self {
             Self::Auto => "自动（不限制）".to_owned(),
             Self::Adaptive => "自动调整码率".to_owned(),
-            Self::Limit(value) => format!("码率上限：{:.1} Mbps", value as f64 / 1_000_000.0),
+            Self::Limit(value) => {
+                let tenths = value / 100_000 + u64::from(value % 100_000 >= 50_000);
+                format!("码率上限：{}.{:01} Mbps", tenths / 10, tenths % 10)
+            }
         }
     }
 }
@@ -521,7 +524,7 @@ struct WindowState {
 }
 
 impl WindowState {
-    fn from_playback_settings(playback_mode: PlaybackMode) -> Self {
+    const fn from_playback_settings(playback_mode: PlaybackMode) -> Self {
         match playback_mode {
             PlaybackMode::Windowed => Self {
                 maximized: false,
@@ -660,7 +663,7 @@ async fn run_actor(
                     MpvCommand::AddOverlay { overlay, completed } => {
                         let request_id = next_request_id;
                         next_request_id = next_request_id.wrapping_add(1);
-                        send_json(&mut writer, overlay_command(overlay, request_id)).await?;
+                        send_json(&mut writer, overlay_command(&overlay, request_id)).await?;
                         pending_overlay_commands.insert(request_id, completed);
                     }
                     MpvCommand::RemoveOverlay(id) => {
@@ -748,7 +751,7 @@ async fn run_actor(
     Ok(())
 }
 
-fn overlay_command(overlay: Overlay, request_id: u64) -> Value {
+fn overlay_command(overlay: &Overlay, request_id: u64) -> Value {
     let stride = overlay.width.saturating_mul(4);
     json!({
         "command": [
@@ -971,12 +974,12 @@ async fn emit_client_message(id: Uuid, value: &Value, events: &mpsc::Sender<MpvE
             let Some(y) = value_as_f64(&arguments[3]) else {
                 return;
             };
-            let width = value_as_f64(&arguments[4]).unwrap_or(0.0).max(0.0) as u32;
-            let height = value_as_f64(&arguments[5]).unwrap_or(0.0).max(0.0) as u32;
+            let width = nonnegative_f64_to_u32(value_as_f64(&arguments[4]).unwrap_or(0.0));
+            let height = nonnegative_f64_to_u32(value_as_f64(&arguments[5]).unwrap_or(0.0));
             let request = MpvPreviewRequest {
                 seconds,
-                x: x.round() as i64,
-                y: y.round() as i64,
+                x: rounded_f64_to_i64(x),
+                y: rounded_f64_to_i64(y),
                 width,
                 height,
             };
@@ -1007,7 +1010,7 @@ fn parse_bitrate_selection(value: &str) -> Option<MpvBitrateSelection> {
         _ => {}
     }
     let value = value.strip_prefix("bitrate-")?.parse::<u64>().ok()?;
-    (value > 0 && value <= i32::MAX as u64).then_some(MpvBitrateSelection::Limit(value))
+    (value > 0 && i32::try_from(value).is_ok()).then_some(MpvBitrateSelection::Limit(value))
 }
 
 fn value_as_f64(value: &Value) -> Option<f64> {
@@ -1015,6 +1018,16 @@ fn value_as_f64(value: &Value) -> Option<f64> {
         .as_f64()
         .or_else(|| value.as_str()?.parse::<f64>().ok())
         .filter(|number| number.is_finite())
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+const fn nonnegative_f64_to_u32(value: f64) -> u32 {
+    value.max(0.0) as u32
+}
+
+#[allow(clippy::cast_possible_truncation)]
+const fn rounded_f64_to_i64(value: f64) -> i64 {
+    value.round() as i64
 }
 
 async fn prepare_script_directory(id: Uuid) -> Result<PathBuf> {
@@ -1069,13 +1082,13 @@ fn ipc_path(id: Uuid) -> PathBuf {
 async fn connect_ipc(path: &Path, child: &mut Child) -> Result<IpcStream> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    for _ in 0..100 {
+    for _ in 0..IPC_CONNECT_ATTEMPTS {
         if let Some(status) = child.try_wait().context("检查 mpv 状态失败")? {
             bail!("mpv 在 IPC 就绪前退出，状态: {status}");
         }
         match ClientOptions::new().open(path) {
             Ok(pipe) => return Ok(Box::new(pipe)),
-            Err(_) => sleep(Duration::from_millis(100)).await,
+            Err(_) => sleep(IPC_CONNECT_RETRY_INTERVAL).await,
         }
     }
     bail!("无法连接 mpv 命名管道 {}", path.display())
@@ -1085,18 +1098,19 @@ async fn connect_ipc(path: &Path, child: &mut Child) -> Result<IpcStream> {
 async fn connect_ipc(path: &Path, child: &mut Child) -> Result<IpcStream> {
     use tokio::net::UnixStream;
 
-    for _ in 0..100 {
+    for _ in 0..IPC_CONNECT_ATTEMPTS {
         if let Some(status) = child.try_wait().context("检查 mpv 状态失败")? {
             bail!("mpv 在 IPC 就绪前退出，状态: {status}");
         }
         match UnixStream::connect(path).await {
             Ok(stream) => return Ok(Box::new(stream)),
-            Err(_) => sleep(Duration::from_millis(100)).await,
+            Err(_) => sleep(IPC_CONNECT_RETRY_INTERVAL).await,
         }
     }
     bail!("无法连接 mpv Unix socket {}", path.display())
 }
 
+#[cfg_attr(windows, allow(clippy::unused_async))]
 async fn cleanup_ipc(path: &Path) {
     #[cfg(unix)]
     if let Err(error) = tokio::fs::remove_file(path).await

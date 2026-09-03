@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+#[cfg(windows)]
 const CREDENTIAL_TARGET: &str = "jellyfin_mpv/login";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -10,6 +11,7 @@ pub struct SavedLogin {
     pub password: String,
 }
 
+#[cfg_attr(not(windows), allow(clippy::missing_const_for_fn))]
 pub fn load_login() -> Result<Option<SavedLogin>> {
     platform::load()
 }
@@ -24,7 +26,7 @@ mod platform {
 
     use anyhow::{Context, Result, bail};
     use windows_sys::Win32::{
-        Foundation::{ERROR_NOT_FOUND, GetLastError},
+        Foundation::{ERROR_NOT_FOUND, FILETIME, GetLastError},
         Security::Credentials::{
             CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
             CredWriteW,
@@ -37,7 +39,7 @@ mod platform {
         unsafe {
             let target = wide(CREDENTIAL_TARGET);
             let mut credential = null_mut();
-            if CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) == 0 {
+            if CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &raw mut credential) == 0 {
                 let error = GetLastError();
                 if error == ERROR_NOT_FOUND {
                     return Ok(None);
@@ -76,7 +78,7 @@ mod platform {
             Type: CRED_TYPE_GENERIC,
             TargetName: target.as_mut_ptr(),
             Comment: null_mut(),
-            LastWritten: Default::default(),
+            LastWritten: FILETIME::default(),
             CredentialBlobSize: blob_size,
             CredentialBlob: blob.as_mut_ptr(),
             Persist: CRED_PERSIST_LOCAL_MACHINE,
@@ -87,7 +89,7 @@ mod platform {
         };
 
         unsafe {
-            if CredWriteW(&credential, 0) == 0 {
+            if CredWriteW(&raw const credential, 0) == 0 {
                 let error = GetLastError();
                 bail!("CredWriteW 失败，Windows 错误码 {error}");
             }
@@ -106,7 +108,8 @@ mod platform {
 
     use super::SavedLogin;
 
-    pub fn load() -> Result<Option<SavedLogin>> {
+    #[allow(clippy::unnecessary_wraps)]
+    pub const fn load() -> Result<Option<SavedLogin>> {
         Ok(None)
     }
 

@@ -29,10 +29,22 @@ const MEDIA_SEGMENT_TIMEOUT: Duration = Duration::from_secs(5);
 const ADAPTIVE_BITRATE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const BUFFERING_TRIGGER: Duration = Duration::from_secs(2);
 const BITRATE_SWITCH_COOLDOWN: Duration = Duration::from_secs(15);
+#[allow(clippy::duration_suboptimal_units)]
 const STABLE_PLAYBACK_BEFORE_RECOVERY: Duration = Duration::from_secs(120);
 const DEFAULT_ADAPTIVE_BITRATE: u64 = 4_000_000;
 const MIN_ADAPTIVE_BITRATE: u64 = 300_000;
 const BITRATE_REDUCTION_PERCENT: u64 = 65;
+const TICKS_PER_SECOND: f64 = 10_000_000.0;
+
+#[allow(clippy::cast_precision_loss)]
+const fn ticks_to_seconds(ticks: i64) -> f64 {
+    ticks as f64 / TICKS_PER_SECOND
+}
+
+#[allow(clippy::cast_possible_truncation)]
+const fn seconds_to_ticks(seconds: f64) -> i64 {
+    (seconds.max(0.0) * TICKS_PER_SECOND) as i64
+}
 
 pub struct Player {
     client: Arc<JellyfinClient>,
@@ -67,6 +79,7 @@ struct Playback {
     muted: bool,
     volume: f64,
     started: bool,
+    startup_started: Instant,
     skip_segments: Vec<SkipSegment>,
     buffering_since: Option<Instant>,
     stable_since: Option<Instant>,
@@ -81,6 +94,7 @@ struct SkipSegment {
     skipped: bool,
 }
 
+#[derive(Debug, PartialEq)]
 enum BitrateAction {
     Switch {
         max_streaming_bitrate: Option<u64>,
@@ -90,6 +104,7 @@ enum BitrateAction {
 }
 
 impl Playback {
+    #[allow(clippy::cast_possible_truncation)]
     fn report(&self) -> PlaybackReport<'_> {
         PlaybackReport {
             item_id: &self.item_id,
@@ -226,7 +241,7 @@ impl Player {
             RemoteCommand::Seek(ticks) => {
                 let playback = self.active_mut()?;
                 let ticks = ticks.max(0);
-                playback.mpv.seek(ticks as f64 / 10_000_000.0).await?;
+                playback.mpv.seek(ticks_to_seconds(ticks)).await?;
                 playback.position_ticks = ticks;
                 mark_passed_skip_segments(&mut playback.skip_segments, ticks);
                 self.report_progress().await;
@@ -266,6 +281,7 @@ impl Player {
     }
 
     async fn play(&mut self, request: PlayRequest) -> Result<()> {
+        let startup_started = Instant::now();
         let index = request.start_index.unwrap_or(0);
         let item_id = request
             .item_ids
@@ -276,36 +292,63 @@ impl Player {
         let start_ticks = request.start_position_ticks.unwrap_or(0).max(0);
 
         info!(%item_id, "正在处理 Jellyfin 播放命令");
+
+        let phase_started = Instant::now();
         self.stop_current(false).await;
-        let item = self.client.item(&self.user_id, &item_id).await?;
-        let info = self
-            .client
-            .playback_info(
-                &self.user_id,
-                &item_id,
-                start_ticks,
-                request.media_source_id.as_deref(),
-                request.audio_stream_index,
-                request.subtitle_stream_index,
-                None,
-            )
-            .await?;
-        let skip_segments =
-            match timeout(MEDIA_SEGMENT_TIMEOUT, self.client.media_segments(&item_id)).await {
-                Ok(Ok(segments)) => prepare_skip_segments(segments, start_ticks),
-                Ok(Err(error)) => {
-                    warn!(%error, %item_id, "读取媒体分段失败，继续普通播放");
-                    Vec::new()
-                }
-                Err(_) => {
-                    warn!(
-                        %item_id,
-                        timeout_seconds = MEDIA_SEGMENT_TIMEOUT.as_secs(),
-                        "读取媒体分段超时，继续普通播放"
-                    );
-                    Vec::new()
-                }
-            };
+        let previous_stop_ms = phase_started.elapsed().as_millis();
+
+        let item_request = async {
+            let phase_started = Instant::now();
+            let item = self.client.item(&self.user_id, &item_id).await?;
+            Ok::<_, anyhow::Error>((item, phase_started.elapsed().as_millis()))
+        };
+        let playback_info_request = async {
+            let phase_started = Instant::now();
+            let info = self
+                .client
+                .playback_info(
+                    &self.user_id,
+                    &item_id,
+                    start_ticks,
+                    request.media_source_id.as_deref(),
+                    request.audio_stream_index,
+                    request.subtitle_stream_index,
+                    None,
+                )
+                .await?;
+            Ok::<_, anyhow::Error>((info, phase_started.elapsed().as_millis()))
+        };
+        let media_segments_request = async {
+            let phase_started = Instant::now();
+            let skip_segments =
+                match timeout(MEDIA_SEGMENT_TIMEOUT, self.client.media_segments(&item_id)).await {
+                    Ok(Ok(segments)) => prepare_skip_segments(segments, start_ticks),
+                    Ok(Err(error)) => {
+                        warn!(%error, %item_id, "读取媒体分段失败，继续普通播放");
+                        Vec::new()
+                    }
+                    Err(_) => {
+                        warn!(
+                            %item_id,
+                            timeout_seconds = MEDIA_SEGMENT_TIMEOUT.as_secs(),
+                            "读取媒体分段超时，继续普通播放"
+                        );
+                        Vec::new()
+                    }
+                };
+            Ok::<_, anyhow::Error>((skip_segments, phase_started.elapsed().as_millis()))
+        };
+        let ((item, item_ms), (info, playback_info_ms), (skip_segments, media_segments_ms)) =
+            tokio::try_join!(item_request, playback_info_request, media_segments_request)?;
+        info!(
+            %item_id,
+            previous_stop_ms = %previous_stop_ms,
+            item_ms = %item_ms,
+            playback_info_ms = %playback_info_ms,
+            media_segments_ms = %media_segments_ms,
+            elapsed_ms = %startup_started.elapsed().as_millis(),
+            "播放启动元数据已准备"
+        );
         let source = request
             .media_source_id
             .as_deref()
@@ -335,12 +378,14 @@ impl Player {
         let audio_stream_index = request
             .audio_stream_index
             .or(source.default_audio_stream_index);
-        let subtitle_stream_index = match request.subtitle_stream_index {
-            Some(index) => (index >= 0).then_some(index),
-            None => source
-                .default_subtitle_stream_index
-                .filter(|index| *index >= 0),
-        };
+        let subtitle_stream_index = request.subtitle_stream_index.map_or_else(
+            || {
+                source
+                    .default_subtitle_stream_index
+                    .filter(|index| *index >= 0)
+            },
+            |index| (index >= 0).then_some(index),
+        );
         let subtitle_url = subtitle_stream_index
             .and_then(|index| {
                 source
@@ -354,6 +399,7 @@ impl Player {
         let media_streams = source.media_streams.clone();
         let trickplay = select_trickplay(&item, &source_id);
         let playback_settings = self.skip_settings.snapshot();
+        let phase_started = Instant::now();
         let mpv = match spawn_mpv(MpvLaunch {
             executable: self.mpv_path.clone(),
             extra_args: self.mpv_args.clone(),
@@ -362,9 +408,11 @@ impl Player {
             playback_mode: playback_settings.playback_mode,
             url,
             headers,
-            start_seconds: start_ticks as f64 / 10_000_000.0,
+            start_seconds: ticks_to_seconds(start_ticks),
             subtitle_url,
-            thumbnail_size: trickplay.as_ref().map(|profile| profile.display_size()),
+            thumbnail_size: trickplay
+                .as_ref()
+                .map(super::thumbnail::TrickplayProfile::display_size),
             bitrate_selection: bitrate_menu_selection(playback_settings.auto_adjust_bitrate, None),
             events: self.mpv_events.clone(),
         })
@@ -373,6 +421,12 @@ impl Player {
             Ok(mpv) => mpv,
             Err(error) => return Err(error),
         };
+        info!(
+            %item_id,
+            mpv_ipc_ms = %phase_started.elapsed().as_millis(),
+            elapsed_ms = %startup_started.elapsed().as_millis(),
+            "mpv 进程、IPC 与加载命令已准备"
+        );
 
         let thumbnail = if let Some(profile) = trickplay {
             match ThumbnailWorker::start(self.client.clone(), mpv.clone(), profile).await {
@@ -410,6 +464,7 @@ impl Player {
             muted: false,
             volume: 100.0,
             started: false,
+            startup_started,
             skip_segments,
             buffering_since: None,
             stable_since: None,
@@ -531,6 +586,12 @@ impl Player {
                 playback.stable_since = Some(Instant::now());
                 if !playback.started {
                     playback.started = true;
+                    info!(
+                        item = %playback.item_name,
+                        item_id = %playback.item_id,
+                        elapsed_ms = %playback.startup_started.elapsed().as_millis(),
+                        "mpv 已加载媒体"
+                    );
                     self.client.report_start(&playback.report()).await?;
                     info!(item = %playback.item_name, "播放已开始并上报 Jellyfin");
                 }
@@ -608,7 +669,7 @@ impl Player {
             return Ok(());
         }
 
-        let position_ticks = (seconds.max(0.0) * 10_000_000.0) as i64;
+        let position_ticks = seconds_to_ticks(seconds);
         let settings = self.skip_settings.snapshot();
         let skip = {
             let playback = self.playback.as_mut().expect("已核对播放 ID");
@@ -623,14 +684,11 @@ impl Player {
             return Ok(());
         };
         let playback = self.playback.as_mut().expect("播放状态仍然存在");
-        playback
-            .mpv
-            .seek(target_ticks as f64 / 10_000_000.0)
-            .await?;
+        playback.mpv.seek(ticks_to_seconds(target_ticks)).await?;
         playback.position_ticks = target_ticks;
         info!(
             segment_type = %kind,
-            target_seconds = target_ticks as f64 / 10_000_000.0,
+            target_seconds = ticks_to_seconds(target_ticks),
             "已自动跳过 Jellyfin 媒体分段"
         );
         self.report_progress().await;
@@ -640,10 +698,15 @@ impl Player {
     async fn select_bitrate(&mut self, selection: MpvBitrateSelection) -> Result<()> {
         let max_streaming_bitrate = selection.max_streaming_bitrate();
         let previous_settings = self.skip_settings.snapshot();
-        let (previous_selection, mpv, needs_switch) = self
-            .playback
-            .as_ref()
-            .map(|playback| {
+        let (previous_selection, mpv, needs_switch) = self.playback.as_ref().map_or_else(
+            || {
+                (
+                    bitrate_menu_selection(previous_settings.auto_adjust_bitrate, None),
+                    None,
+                    false,
+                )
+            },
+            |playback| {
                 (
                     bitrate_menu_selection(
                         previous_settings.auto_adjust_bitrate,
@@ -652,14 +715,8 @@ impl Player {
                     Some(playback.mpv.clone()),
                     playback.max_streaming_bitrate != max_streaming_bitrate,
                 )
-            })
-            .unwrap_or_else(|| {
-                (
-                    bitrate_menu_selection(previous_settings.auto_adjust_bitrate, None),
-                    None,
-                    false,
-                )
-            });
+            },
+        );
         let settings_changed =
             previous_settings.auto_adjust_bitrate != selection.enables_auto_adjustment();
         if settings_changed {
@@ -747,48 +804,44 @@ impl Player {
         }
 
         let now = Instant::now();
-        let action = {
-            let Some(playback) = self.playback.as_ref() else {
-                return Ok(());
-            };
-            if !playback.started || playback.paused {
-                return Ok(());
-            }
-
-            let cooldown_elapsed = playback
-                .last_bitrate_switch
-                .is_none_or(|last| now.duration_since(last) >= BITRATE_SWITCH_COOLDOWN);
-            if !cooldown_elapsed {
-                return Ok(());
-            }
-
-            if playback
-                .buffering_since
-                .is_some_and(|since| now.duration_since(since) >= BUFFERING_TRIGGER)
+        let action =
             {
-                match next_lower_bitrate(playback.max_streaming_bitrate, playback.source_bitrate) {
-                    Some(max_streaming_bitrate) => Some(BitrateAction::Switch {
-                        max_streaming_bitrate: Some(max_streaming_bitrate),
-                        recovery: false,
-                    }),
-                    None => Some(BitrateAction::Exhausted),
+                let Some(playback) = self.playback.as_ref() else {
+                    return Ok(());
+                };
+                if !playback.started || playback.paused {
+                    return Ok(());
                 }
-            } else if playback.buffering_since.is_none()
-                && playback.max_streaming_bitrate.is_some()
-                && playback.stable_since.is_some_and(|since| {
-                    now.duration_since(since) >= STABLE_PLAYBACK_BEFORE_RECOVERY
-                })
-            {
-                next_higher_bitrate(playback.max_streaming_bitrate, playback.source_bitrate).map(
-                    |max_streaming_bitrate| BitrateAction::Switch {
-                        max_streaming_bitrate,
-                        recovery: true,
-                    },
-                )
-            } else {
-                None
-            }
-        };
+
+                let cooldown_elapsed = playback
+                    .last_bitrate_switch
+                    .is_none_or(|last| now.duration_since(last) >= BITRATE_SWITCH_COOLDOWN);
+                if !cooldown_elapsed {
+                    return Ok(());
+                }
+
+                if playback
+                    .buffering_since
+                    .is_some_and(|since| now.duration_since(since) >= BUFFERING_TRIGGER)
+                {
+                    next_lower_bitrate(playback.max_streaming_bitrate, playback.source_bitrate)
+                        .map_or(Some(BitrateAction::Exhausted), |max_streaming_bitrate| {
+                            Some(BitrateAction::Switch {
+                                max_streaming_bitrate: Some(max_streaming_bitrate),
+                                recovery: false,
+                            })
+                        })
+                } else if playback.buffering_since.is_none()
+                    && playback.max_streaming_bitrate.is_some()
+                    && playback.stable_since.is_some_and(|since| {
+                        now.duration_since(since) >= STABLE_PLAYBACK_BEFORE_RECOVERY
+                    })
+                {
+                    next_higher_bitrate(playback.max_streaming_bitrate, playback.source_bitrate)
+                } else {
+                    None
+                }
+            };
 
         match action {
             Some(BitrateAction::Switch {
@@ -802,9 +855,10 @@ impl Player {
                 if let Some(playback) = self.playback.as_mut() {
                     if switched {
                         if recovery {
-                            match max_streaming_bitrate {
-                                Some(value) => info!(bitrate_bps = value, "稳定播放后恢复较高码率"),
-                                None => info!("稳定播放后恢复原始最高码率"),
+                            if let Some(value) = max_streaming_bitrate {
+                                info!(bitrate_bps = value, "稳定播放后恢复较高码率");
+                            } else {
+                                info!("稳定播放后恢复原始最高码率");
                             }
                             playback.stable_since = Some(now);
                         } else {
@@ -909,7 +963,7 @@ impl Player {
             .mpv_http_headers(&source.required_http_headers)
             .await;
         mpv.set_http_headers(headers).await?;
-        mpv.load_file(url, position_ticks as f64 / 10_000_000.0, subtitle_url)
+        mpv.load_file(url, ticks_to_seconds(position_ticks), subtitle_url)
             .await?;
 
         let new_source_bitrate = media_source_bitrate(source);
@@ -996,7 +1050,7 @@ impl Player {
     }
 }
 
-fn playback_method(source: &MediaSource) -> &'static str {
+const fn playback_method(source: &MediaSource) -> &'static str {
     if source.transcoding_url.is_some() {
         "Transcode"
     } else if source.supports_direct_play {
@@ -1020,9 +1074,7 @@ fn bitrate_menu_selection(
     if auto_adjust_bitrate {
         MpvBitrateSelection::Adaptive
     } else {
-        max_streaming_bitrate
-            .map(MpvBitrateSelection::Limit)
-            .unwrap_or(MpvBitrateSelection::Auto)
+        max_streaming_bitrate.map_or(MpvBitrateSelection::Auto, MpvBitrateSelection::Limit)
     }
 }
 
@@ -1038,20 +1090,29 @@ fn next_lower_bitrate(current: Option<u64>, source_bitrate: Option<u64>) -> Opti
     (next >= MIN_ADAPTIVE_BITRATE && next < baseline).then_some(next)
 }
 
-fn next_higher_bitrate(current: Option<u64>, source_bitrate: Option<u64>) -> Option<Option<u64>> {
+fn next_higher_bitrate(current: Option<u64>, source_bitrate: Option<u64>) -> Option<BitrateAction> {
     let current = current?;
     let ceiling = source_bitrate.unwrap_or(DEFAULT_ADAPTIVE_BITRATE);
     if current >= ceiling {
-        return Some(None);
+        return Some(BitrateAction::Switch {
+            max_streaming_bitrate: None,
+            recovery: true,
+        });
     }
 
     let increased = current
         .saturating_mul(100)
         .saturating_div(BITRATE_REDUCTION_PERCENT);
     if increased >= ceiling {
-        Some(None)
+        Some(BitrateAction::Switch {
+            max_streaming_bitrate: None,
+            recovery: true,
+        })
     } else if increased > current {
-        Some(Some(increased))
+        Some(BitrateAction::Switch {
+            max_streaming_bitrate: Some(increased),
+            recovery: true,
+        })
     } else {
         None
     }
@@ -1210,11 +1271,17 @@ mod tests {
         );
         assert_eq!(
             next_higher_bitrate(Some(4_225_000), Some(10_000_000)),
-            Some(Some(6_500_000))
+            Some(BitrateAction::Switch {
+                max_streaming_bitrate: Some(6_500_000),
+                recovery: true,
+            })
         );
         assert_eq!(
             next_higher_bitrate(Some(6_500_000), Some(10_000_000)),
-            Some(None)
+            Some(BitrateAction::Switch {
+                max_streaming_bitrate: None,
+                recovery: true,
+            })
         );
     }
 

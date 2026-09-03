@@ -109,6 +109,7 @@ impl JellyfinClient {
         auth.access_token = result.access_token;
         auth.http = http;
         auth.generation = auth.generation.wrapping_add(1);
+        drop(auth);
         info!("Access Token 已更新");
         Ok(())
     }
@@ -132,7 +133,7 @@ impl JellyfinClient {
             .context("重新登录后重试 HTTP 请求失败")
     }
 
-    async fn post_authenticated<T: Serialize + ?Sized>(
+    async fn post_authenticated<T: Serialize + Sync + ?Sized>(
         &self,
         url: Url,
         body: &T,
@@ -536,7 +537,7 @@ impl JellyfinClient {
             .context("解析 Jellyfin JSON 响应失败")
     }
 
-    async fn post_json<T: Serialize + ?Sized>(&self, url: Url, body: &T) -> Result<()> {
+    async fn post_json<T: Serialize + Sync + ?Sized>(&self, url: Url, body: &T) -> Result<()> {
         let response = self.post_authenticated(url, body).await?;
         ensure_success(response).await?;
         Ok(())
@@ -708,9 +709,11 @@ fn playback_profile(
     subtitle_index: Option<i32>,
     max_streaming_bitrate: Option<u64>,
 ) -> Value {
-    let max_streaming_bitrate = max_streaming_bitrate
-        .map(|value| value.min(MAX_JELLYFIN_STREAMING_BITRATE as u64) as i64)
-        .unwrap_or(MAX_JELLYFIN_STREAMING_BITRATE);
+    let max_streaming_bitrate =
+        max_streaming_bitrate.map_or(MAX_JELLYFIN_STREAMING_BITRATE, |value| {
+            i64::try_from(value.min(MAX_JELLYFIN_STREAMING_BITRATE as u64))
+                .unwrap_or(MAX_JELLYFIN_STREAMING_BITRATE)
+        });
 
     json!({
         "UserId": user_id,

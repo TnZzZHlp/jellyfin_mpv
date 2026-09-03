@@ -14,6 +14,7 @@ pub enum PlaybackMode {
     Fullscreen,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct SkipSettings {
@@ -111,7 +112,7 @@ impl SkipSettingsStore {
         Ok(Self::new(path, current))
     }
 
-    fn new(path: PathBuf, current: SkipSettings) -> Self {
+    const fn new(path: PathBuf, current: SkipSettings) -> Self {
         Self {
             path,
             current: RwLock::new(current),
@@ -119,15 +120,13 @@ impl SkipSettingsStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(path: PathBuf, current: SkipSettings) -> Self {
+    pub(crate) const fn for_test(path: PathBuf, current: SkipSettings) -> Self {
         Self::new(path, current)
     }
 }
 
 fn settings_path() -> PathBuf {
-    let base = env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
+    let base = env::var_os("LOCALAPPDATA").map_or_else(env::temp_dir, PathBuf::from);
     base.join("jellyfin_mpv").join("settings.json")
 }
 

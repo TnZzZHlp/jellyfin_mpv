@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::{credential_store::SavedLogin, skip_settings::SkipSettingsStore};
 
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone)]
 pub struct SettingsContext {
     pub login: Arc<RwLock<SavedLogin>>,
@@ -12,6 +13,7 @@ pub struct SettingsContext {
     pub connection_updates: mpsc::UnboundedSender<SavedLogin>,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn show_settings(context: SettingsContext) -> Result<()> {
     platform::show(context)
 }
@@ -77,7 +79,7 @@ mod platform {
     }
 
     impl SettingsState {
-        fn new(context: SettingsContext) -> Self {
+        const fn new(context: SettingsContext) -> Self {
             Self {
                 context,
                 server: null_mut(),
@@ -110,7 +112,7 @@ mod platform {
                 lpszClassName: class_name.as_ptr(),
                 ..std::mem::zeroed()
             };
-            RegisterClassW(&window_class);
+            RegisterClassW(&raw const window_class);
 
             let state = Box::new(SettingsState::new(context));
             let state_ptr = Box::into_raw(state);
@@ -150,7 +152,7 @@ mod platform {
 
             let mut message: MSG = std::mem::zeroed();
             while IsWindow(hwnd) != 0 {
-                let status = GetMessageW(&mut message, null_mut(), 0, 0);
+                let status = GetMessageW(&raw mut message, null_mut(), 0, 0);
                 if status == -1 {
                     DestroyWindow(hwnd);
                     drop(Box::from_raw(state_ptr));
@@ -159,9 +161,9 @@ mod platform {
                 if status == 0 {
                     break;
                 }
-                if IsDialogMessageW(hwnd, &message) == 0 {
-                    TranslateMessage(&message);
-                    DispatchMessageW(&message);
+                if IsDialogMessageW(hwnd, &raw const message) == 0 {
+                    TranslateMessage(&raw const message);
+                    DispatchMessageW(&raw const message);
                 }
             }
 
@@ -494,7 +496,7 @@ mod platform {
         Ok(selector)
     }
 
-    fn playback_mode_index(mode: PlaybackMode) -> usize {
+    const fn playback_mode_index(mode: PlaybackMode) -> usize {
         match mode {
             PlaybackMode::Windowed => 0,
             PlaybackMode::Maximized => 1,
@@ -607,11 +609,10 @@ mod platform {
     }
 
     unsafe fn save(hwnd: HWND, state: &mut SettingsState) {
-        let input = match validate_input(
-            unsafe { control_text(state.server) },
-            unsafe { control_text(state.username) },
-            unsafe { control_text(state.password) },
-        ) {
+        let server = unsafe { control_text(state.server) };
+        let username = unsafe { control_text(state.username) };
+        let password = unsafe { control_text(state.password) };
+        let input = match validate_input(&server, &username, password) {
             Ok(input) => input,
             Err(error) => {
                 unsafe { show_error(hwnd, &error.to_string()) };
@@ -684,11 +685,11 @@ mod platform {
     }
 
     unsafe fn is_checked(hwnd: HWND) -> bool {
-        unsafe { SendMessageW(hwnd, BM_GETCHECK, 0, 0) as u32 == BST_CHECKED }
+        unsafe { SendMessageW(hwnd, BM_GETCHECK, 0, 0) == 1 }
     }
 
     unsafe fn selected_playback_mode(hwnd: HWND) -> PlaybackMode {
-        match unsafe { SendMessageW(hwnd, CB_GETCURSEL, 0, 0) as i32 } {
+        match unsafe { SendMessageW(hwnd, CB_GETCURSEL, 0, 0) } {
             0 => PlaybackMode::Windowed,
             2 => PlaybackMode::Fullscreen,
             _ => PlaybackMode::Maximized,
@@ -696,10 +697,13 @@ mod platform {
     }
 
     unsafe fn control_text(hwnd: HWND) -> String {
-        let length = unsafe { GetWindowTextLengthW(hwnd) };
-        let mut buffer = vec![0u16; length.max(0) as usize + 1];
-        let copied = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
-        String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
+        let length = usize::try_from(unsafe { GetWindowTextLengthW(hwnd) }).unwrap_or(0);
+        let mut buffer = vec![0u16; length.saturating_add(1)];
+        let capacity = i32::try_from(buffer.len()).unwrap_or(i32::MAX);
+        let copied =
+            usize::try_from(unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), capacity) })
+                .unwrap_or(0);
+        String::from_utf16_lossy(&buffer[..copied.min(buffer.len())])
     }
 
     fn wide(value: &str) -> Vec<u16> {
@@ -710,6 +714,7 @@ mod platform {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 mod platform {
     use anyhow::{Result, bail};
 

@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use url::Url;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct LoginDefaults {
     pub server: String,
     pub username: String,
@@ -21,11 +22,8 @@ pub fn show_error_message(message: &str) {
     platform::show_error(message);
 }
 
-pub(crate) fn validate_input(
-    server: String,
-    username: String,
-    password: String,
-) -> Result<LoginInput> {
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn validate_input(server: &str, username: &str, password: String) -> Result<LoginInput> {
     let server_text = server.trim();
     if server_text.is_empty() {
         bail!("请输入 Jellyfin 地址");
@@ -95,7 +93,7 @@ mod platform {
     }
 
     impl LoginState {
-        fn new(defaults: LoginDefaults) -> Self {
+        const fn new(defaults: LoginDefaults) -> Self {
             Self {
                 defaults,
                 server: null_mut(),
@@ -126,7 +124,7 @@ mod platform {
                 lpszMenuName: null(),
                 lpszClassName: class_name.as_ptr(),
             };
-            RegisterClassW(&window_class);
+            RegisterClassW(&raw const window_class);
 
             let state = Box::new(LoginState::new(defaults));
             let state_ptr = Box::into_raw(state);
@@ -166,7 +164,7 @@ mod platform {
 
             let mut message: MSG = std::mem::zeroed();
             loop {
-                let status = GetMessageW(&mut message, null_mut(), 0, 0);
+                let status = GetMessageW(&raw mut message, null_mut(), 0, 0);
                 if status == -1 {
                     DestroyWindow(hwnd);
                     drop(Box::from_raw(state_ptr));
@@ -185,9 +183,9 @@ mod platform {
                         continue;
                     }
                 }
-                if IsDialogMessageW(hwnd, &message) == 0 {
-                    TranslateMessage(&message);
-                    DispatchMessageW(&message);
+                if IsDialogMessageW(hwnd, &raw const message) == 0 {
+                    TranslateMessage(&raw const message);
+                    DispatchMessageW(&raw const message);
                 }
             }
 
@@ -477,7 +475,7 @@ mod platform {
         let server = unsafe { control_text(state.server) };
         let username = unsafe { control_text(state.username) };
         let password = unsafe { control_text(state.password) };
-        match validate_input(server, username, password) {
+        match validate_input(&server, &username, password) {
             Ok(input) => {
                 state.result = Some(input);
                 unsafe { DestroyWindow(hwnd) };
@@ -493,10 +491,13 @@ mod platform {
     }
 
     unsafe fn control_text(hwnd: HWND) -> String {
-        let length = unsafe { GetWindowTextLengthW(hwnd) };
-        let mut buffer = vec![0u16; length.max(0) as usize + 1];
-        let copied = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
-        String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
+        let length = usize::try_from(unsafe { GetWindowTextLengthW(hwnd) }).unwrap_or(0);
+        let mut buffer = vec![0u16; length.saturating_add(1)];
+        let capacity = i32::try_from(buffer.len()).unwrap_or(i32::MAX);
+        let copied =
+            usize::try_from(unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), capacity) })
+                .unwrap_or(0);
+        String::from_utf16_lossy(&buffer[..copied.min(buffer.len())])
     }
 
     fn wide(value: &str) -> Vec<u16> {
@@ -527,12 +528,8 @@ mod tests {
 
     #[test]
     fn accepts_valid_login_input() {
-        let input = validate_input(
-            " http://localhost:8096 ".to_owned(),
-            " alice ".to_owned(),
-            "secret".to_owned(),
-        )
-        .unwrap();
+        let input =
+            validate_input(" http://localhost:8096 ", " alice ", "secret".to_owned()).unwrap();
         assert_eq!(input.server.as_str(), "http://localhost:8096/");
         assert_eq!(input.username, "alice");
         assert_eq!(input.password, "secret");
@@ -540,19 +537,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_login_input() {
-        assert!(
-            validate_input("ftp://localhost".to_owned(), "a".to_owned(), "p".to_owned()).is_err()
-        );
-        assert!(
-            validate_input(
-                "http://localhost".to_owned(),
-                " ".to_owned(),
-                "p".to_owned()
-            )
-            .is_err()
-        );
-        assert!(
-            validate_input("http://localhost".to_owned(), "a".to_owned(), String::new()).is_err()
-        );
+        assert!(validate_input("ftp://localhost", "a", "p".to_owned()).is_err());
+        assert!(validate_input("http://localhost", " ", "p".to_owned()).is_err());
+        assert!(validate_input("http://localhost", "a", String::new()).is_err());
     }
 }

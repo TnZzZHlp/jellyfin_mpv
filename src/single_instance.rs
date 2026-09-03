@@ -69,7 +69,8 @@ mod platform {
 
     pub struct SingleInstanceGuard;
 
-    pub fn acquire() -> Result<Option<SingleInstanceGuard>> {
+    #[allow(clippy::unnecessary_wraps)]
+    pub const fn acquire() -> Result<Option<SingleInstanceGuard>> {
         Ok(Some(SingleInstanceGuard))
     }
 }
