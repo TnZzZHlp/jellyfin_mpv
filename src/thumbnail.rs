@@ -151,6 +151,10 @@ fn replace_request_if_changed(
     true
 }
 
+fn preview_request_changed(receiver: &watch::Receiver<Option<MpvPreviewRequest>>) -> bool {
+    receiver.has_changed().unwrap_or(false)
+}
+
 struct TileStore {
     client: Arc<JellyfinClient>,
     profile: TrickplayProfile,
@@ -273,14 +277,11 @@ async fn run_worker(
 
         let mut request = receiver.borrow_and_update().clone();
         loop {
-            // uosc moves its thumbnail background immediately. Remove the old
-            // bitmap before preparing the new frame so it cannot remain behind
-            // at the previous cursor position while a tile is downloading.
-            let _ = mpv.remove_overlay(OVERLAY_ID).await;
-
             let Some(current) = request.as_ref() else {
+                let _ = mpv.remove_overlay(OVERLAY_ID).await;
                 break;
             };
+            let render_receiver = receiver.clone();
             tokio::select! {
                 () = cancellation.cancelled() => break 'worker,
                 changed = receiver.changed() => {
@@ -290,11 +291,10 @@ async fn run_worker(
                     request.clone_from(&receiver.borrow_and_update());
                 }
                 result = render_preview(
-                    &store, &mpv, current, &output, &mut cache,
+                    &store, &mpv, current, &render_receiver, &output, &mut cache,
                 ) => {
                     if let Err(error) = result {
                         warn!(%error, "显示 Jellyfin Trickplay 缩略图失败");
-                        let _ = mpv.remove_overlay(OVERLAY_ID).await;
                     }
                     break;
                 }
@@ -308,6 +308,7 @@ async fn render_preview(
     store: &TileStore,
     mpv: &MpvHandle,
     request: &MpvPreviewRequest,
+    receiver: &watch::Receiver<Option<MpvPreviewRequest>>,
     output: &PathBuf,
     cache: &mut Option<CachedTile>,
 ) -> Result<()> {
@@ -332,6 +333,9 @@ async fn render_preview(
     tokio::fs::write(output, pixels)
         .await
         .context("写入 mpv 缩略图像素失败")?;
+    if preview_request_changed(receiver) {
+        return Ok(());
+    }
 
     let (x, y, width, height) = fit_destination(request, &profile.info);
     mpv.add_overlay(Overlay {
@@ -560,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_repeated_identical_preview_requests() {
+    fn coalesces_identical_and_detects_new_preview_requests() {
         let request = MpvPreviewRequest {
             seconds: 25.0,
             x: 100,
@@ -574,7 +578,16 @@ mod tests {
         assert!(receiver.has_changed().unwrap());
         receiver.borrow_and_update();
 
-        assert!(!replace_request_if_changed(&sender, Some(request)));
-        assert!(!receiver.has_changed().unwrap());
+        assert!(!replace_request_if_changed(&sender, Some(request.clone())));
+        assert!(!preview_request_changed(&receiver));
+
+        assert!(replace_request_if_changed(
+            &sender,
+            Some(MpvPreviewRequest {
+                seconds: 35.0,
+                ..request
+            })
+        ));
+        assert!(preview_request_changed(&receiver));
     }
 }

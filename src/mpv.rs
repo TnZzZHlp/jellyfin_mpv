@@ -437,21 +437,13 @@ pub async fn spawn_mpv(launch: MpvLaunch) -> Result<MpvHandle> {
         }
     };
     let mut command = Command::new(&executable);
-    command.args(window_args(window_state, &extra_args));
-    if let Some(directory) = script_directory.as_ref() {
-        command.arg(format!(
-            "--script={}",
-            directory.join("quality_menu.lua").to_string_lossy()
-        ));
-    }
-    if thumbnail_size.is_some()
-        && let Some(directory) = script_directory.as_ref()
-    {
-        command.arg(format!(
-            "--script={}",
-            directory.join("thumbfast.lua").to_string_lossy()
-        ));
-    }
+    command.args(window_args(window_state, &[]));
+    append_script_args(
+        &mut command,
+        script_directory.as_deref(),
+        thumbnail_size.is_some(),
+        &extra_args,
+    );
     command
         .arg("--idle=yes")
         .arg("--terminal=no")
@@ -571,6 +563,27 @@ fn window_args(window_state: WindowState, extra_args: &[OsString]) -> Vec<OsStri
     ];
     args.extend_from_slice(extra_args);
     args
+}
+
+fn append_script_args(
+    command: &mut Command,
+    script_directory: Option<&Path>,
+    thumbnail_enabled: bool,
+    extra_args: &[OsString],
+) {
+    if thumbnail_enabled && let Some(directory) = script_directory {
+        command.arg(format!(
+            "--script={}",
+            directory.join("thumbfast.lua").to_string_lossy()
+        ));
+    }
+    command.args(extra_args);
+    if let Some(directory) = script_directory {
+        command.arg(format!(
+            "--script={}",
+            directory.join("quality_menu.lua").to_string_lossy()
+        ));
+    }
 }
 
 fn mpv_boolean_option(name: &str, value: bool) -> OsString {
@@ -1172,6 +1185,23 @@ mod tests {
         assert_eq!(args[2], "--no-fullscreen");
     }
 
+    #[test]
+    fn orders_thumbnail_bridge_before_user_script_arguments() {
+        let extra_args = [OsString::from("--script=user/thumbfast.lua")];
+        let mut command = Command::new("mpv");
+        append_script_args(&mut command, Some(Path::new("embedded")), true, &extra_args);
+
+        let args: Vec<OsString> = command
+            .as_std()
+            .get_args()
+            .map(std::ffi::OsStr::to_os_string)
+            .collect();
+        assert_eq!(args.len(), 3);
+        assert!(args[0].to_string_lossy().ends_with("thumbfast.lua"));
+        assert_eq!(args[1], extra_args[0]);
+        assert!(args[2].to_string_lossy().ends_with("quality_menu.lua"));
+    }
+
     #[tokio::test]
     async fn sets_media_and_window_titles_through_ipc() {
         let (mut writer, mut reader) = duplex(1024);
@@ -1526,6 +1556,13 @@ mod tests {
         ));
         assert!(result.await.unwrap().is_ok());
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn thumbnail_bridge_reasserts_its_info_after_competing_scripts() {
+        let script = std::str::from_utf8(include_bytes!("thumbfast.lua")).unwrap();
+        assert!(script.contains("register_script_message(\"thumbfast-info\""));
+        assert!(script.contains("info ~= thumbfast_info"));
     }
 
     #[tokio::test]

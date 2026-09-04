@@ -3,21 +3,22 @@ local utils = require "mp.utils"
 local thumbnail_width = 0
 local thumbnail_height = 0
 local enabled = false
+local thumbfast_info = nil
 
 local function broadcast(name, ...)
     mp.commandv("script-message", name, ...)
 end
 
 local function send_thumbfast_info()
-    local json = utils.format_json({
+    thumbfast_info = utils.format_json({
         width = thumbnail_width,
         height = thumbnail_height,
         disabled = not enabled,
         available = enabled,
         overlay_id = 47,
     })
-    if json then
-        broadcast("thumbfast-info", json)
+    if thumbfast_info then
+        broadcast("thumbfast-info", thumbfast_info)
     end
 end
 
@@ -53,6 +54,13 @@ mp.register_script_message("thumb", function(seconds, x, y)
     request_preview(seconds, x, y, thumbnail_width, thumbnail_height)
 end)
 mp.register_script_message("clear", clear_preview)
+
+-- An installed thumbfast script can overwrite the global state used by OSC scripts.
+mp.register_script_message("thumbfast-info", function(info)
+    if enabled and info ~= thumbfast_info then
+        send_thumbfast_info()
+    end
+end)
 
 -- Newer versions of mpv's built-in OSC expose preview requests through user-data.
 mp.observe_property("user-data/osc/draw-preview", "native", function(_, preview)
