@@ -4,7 +4,7 @@
 
 ## 预览
 
-<video src="https://raw.githubusercontent.com/TnZzZHlp/jellyfin_mpv/main/preview/download.mp4" controls width="800"></video>
+![预览视频](preview/download.gif)
 
 当前版本支持：
 
