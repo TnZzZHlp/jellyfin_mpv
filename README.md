@@ -2,6 +2,10 @@
 
 一个单服务器、外部 mpv 的 Jellyfin 投屏接收端。程序只提供简单的登录窗口，不提供媒体库界面；连接后在后台注册为可远程控制的播放设备。
 
+## 预览
+
+<video src="https://raw.githubusercontent.com/TnZzZHlp/jellyfin_mpv/main/preview/download.mp4" controls width="800"></video>
+
 当前版本支持：
 
 - Windows 上可在登录窗口中输入地址、用户名和明文密码，也可使用命令行参数登录；
